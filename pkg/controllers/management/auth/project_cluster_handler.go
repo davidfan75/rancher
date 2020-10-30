@@ -1,25 +1,30 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/rancher/norman/condition"
-	systemimage "github.com/rancher/rancher/pkg/controllers/user/systemimage"
+	v32 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	systemimage "github.com/rancher/rancher/pkg/controllers/managementuser/systemimage"
+	corev1 "github.com/rancher/rancher/pkg/generated/norman/core/v1"
+	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
+	rrbacv1 "github.com/rancher/rancher/pkg/generated/norman/rbac.authorization.k8s.io/v1"
 	"github.com/rancher/rancher/pkg/project"
-	corev1 "github.com/rancher/types/apis/core/v1"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	rrbacv1 "github.com/rancher/types/apis/rbac.authorization.k8s.io/v1"
-	"github.com/rancher/types/config"
+	"github.com/rancher/rancher/pkg/settings"
+	"github.com/rancher/rancher/pkg/systemaccount"
+	"github.com/rancher/rancher/pkg/types/config"
 	"github.com/sirupsen/logrus"
 	v12 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -36,7 +41,7 @@ const (
 
 var defaultProjectLabels = labels.Set(map[string]string{"authz.management.cattle.io/default-project": "true"})
 var systemProjectLabels = labels.Set(map[string]string{"authz.management.cattle.io/system-project": "true"})
-var crtbCeatorOwnerAnnotations = map[string]string{creatorOwnerBindingAnnotation: "true"}
+var crtbCreatorOwnerAnnotations = map[string]string{creatorOwnerBindingAnnotation: "true"}
 
 var defaultProjects = map[string]bool{
 	project.Default: true,
@@ -47,13 +52,15 @@ var systemProjects = map[string]bool{
 
 func newPandCLifecycles(management *config.ManagementContext) (*projectLifecycle, *clusterLifecycle) {
 	m := &mgr{
-		mgmt:               management,
-		nsLister:           management.Core.Namespaces("").Controller().Lister(),
-		prtbLister:         management.Management.ProjectRoleTemplateBindings("").Controller().Lister(),
-		crtbLister:         management.Management.ClusterRoleTemplateBindings("").Controller().Lister(),
-		projectLister:      management.Management.Projects("").Controller().Lister(),
-		roleTemplateLister: management.Management.RoleTemplates("").Controller().Lister(),
-		clusterRoleClient:  management.RBAC.ClusterRoles(""),
+		mgmt:                 management,
+		nsLister:             management.Core.Namespaces("").Controller().Lister(),
+		prtbLister:           management.Management.ProjectRoleTemplateBindings("").Controller().Lister(),
+		crtbLister:           management.Management.ClusterRoleTemplateBindings("").Controller().Lister(),
+		crtbClient:           management.Management.ClusterRoleTemplateBindings(""),
+		projectLister:        management.Management.Projects("").Controller().Lister(),
+		projects:             management.Management.Projects(""),
+		roleTemplateLister:   management.Management.RoleTemplates("").Controller().Lister(),
+		systemAccountManager: systemaccount.NewManager(management),
 	}
 	p := &projectLifecycle{
 		mgr: m,
@@ -69,7 +76,17 @@ type projectLifecycle struct {
 }
 
 func (l *projectLifecycle) sync(key string, orig *v3.Project) (runtime.Object, error) {
-	if orig == nil {
+	if orig == nil || orig.DeletionTimestamp != nil {
+		projectID := ""
+		splits := strings.Split(key, "/")
+		if len(splits) == 2 {
+			projectID = splits[1]
+		}
+		// remove the system account created for this project
+		logrus.Debugf("Deleting system user for project %v", projectID)
+		if err := l.mgr.systemAccountManager.RemoveSystemAccount(projectID); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 
@@ -97,7 +114,25 @@ func (l *projectLifecycle) sync(key string, orig *v3.Project) (runtime.Object, e
 		return nil, err
 	}
 
+	if err := l.enqueueCrtbs(orig); err != nil {
+		return nil, err
+	}
+
 	return nil, nil
+}
+
+func (l *projectLifecycle) enqueueCrtbs(project *v3.Project) error {
+	// get all crtbs in current project's cluster
+	clusterID := project.Namespace
+	crtbs, err := l.mgr.crtbLister.List(clusterID, labels.Everything())
+	if err != nil {
+		return err
+	}
+	// enqueue them so crtb controller picks them up and lists all projects and generates rolebindings for each crtb in the projects
+	for _, crtb := range crtbs {
+		l.mgr.crtbClient.Controller().Enqueue(clusterID, crtb.Name)
+	}
+	return nil
 }
 
 func (l *projectLifecycle) Create(obj *v3.Project) (runtime.Object, error) {
@@ -189,19 +224,22 @@ type mgr struct {
 	mgmt          *config.ManagementContext
 	nsLister      corev1.NamespaceLister
 	projectLister v3.ProjectLister
+	projects      v3.ProjectInterface
 
-	prtbLister         v3.ProjectRoleTemplateBindingLister
-	crtbLister         v3.ClusterRoleTemplateBindingLister
-	roleTemplateLister v3.RoleTemplateLister
-	clusterRoleClient  rrbacv1.ClusterRoleInterface
+	prtbLister           v3.ProjectRoleTemplateBindingLister
+	crtbLister           v3.ClusterRoleTemplateBindingLister
+	crtbClient           v3.ClusterRoleTemplateBindingInterface
+	roleTemplateLister   v3.RoleTemplateLister
+	clusterRoleClient    rrbacv1.ClusterRoleInterface
+	systemAccountManager *systemaccount.Manager
 }
 
 func (m *mgr) createDefaultProject(obj runtime.Object) (runtime.Object, error) {
-	return m.createProject(project.Default, v3.ClusterConditionconditionDefaultProjectCreated, obj, defaultProjectLabels, defaultProjects)
+	return m.createProject(project.Default, v32.ClusterConditionconditionDefaultProjectCreated, obj, defaultProjectLabels, defaultProjects)
 }
 
 func (m *mgr) createSystemProject(obj runtime.Object) (runtime.Object, error) {
-	return m.createProject(project.System, v3.ClusterConditionconditionSystemProjectCreated, obj, systemProjectLabels, systemProjects)
+	return m.createProject(project.System, v32.ClusterConditionconditionSystemProjectCreated, obj, systemProjectLabels, systemProjects)
 }
 
 func (m *mgr) createProject(name string, cond condition.Cond, obj runtime.Object, labels labels.Set, projectMap map[string]bool) (runtime.Object, error) {
@@ -210,6 +248,7 @@ func (m *mgr) createProject(name string, cond condition.Cond, obj runtime.Object
 		if err != nil {
 			return obj, err
 		}
+		// Attempt to use the cache first
 		projects, err := m.projectLister.List(metaAccessor.GetName(), labels.AsSelector())
 		if err != nil {
 			return obj, err
@@ -217,6 +256,16 @@ func (m *mgr) createProject(name string, cond condition.Cond, obj runtime.Object
 		if len(projects) > 0 {
 			return obj, nil
 		}
+
+		// Cache failed, try the API
+		projects2, err := m.projects.ListNamespaced(metaAccessor.GetName(), v1.ListOptions{LabelSelector: labels.String()})
+		if err != nil {
+			return obj, err
+		}
+		if len(projects2.Items) > 0 {
+			return obj, nil
+		}
+
 		creatorID, ok := metaAccessor.GetAnnotations()[creatorIDAnn]
 		if !ok {
 			logrus.Warnf("Cluster %v has no creatorId annotation. Cannot create %s project", metaAccessor.GetName(), name)
@@ -241,7 +290,7 @@ func (m *mgr) createProject(name string, cond condition.Cond, obj runtime.Object
 				Annotations:  annotation,
 				Labels:       labels,
 			},
-			Spec: v3.ProjectSpec{
+			Spec: v32.ProjectSpec{
 				DisplayName: name,
 				Description: fmt.Sprintf("%s project created for the cluster", name),
 				ClusterName: metaAccessor.GetName(),
@@ -261,7 +310,7 @@ func (m *mgr) createProject(name string, cond condition.Cond, obj runtime.Object
 }
 
 func (m *mgr) reconcileCreatorRTB(obj runtime.Object) (runtime.Object, error) {
-	return v3.CreatorMadeOwner.DoUntilTrue(obj, func() (runtime.Object, error) {
+	return v32.CreatorMadeOwner.DoUntilTrue(obj, func() (runtime.Object, error) {
 		metaAccessor, err := meta.Accessor(obj)
 		if err != nil {
 			return obj, err
@@ -282,7 +331,7 @@ func (m *mgr) reconcileCreatorRTB(obj runtime.Object) (runtime.Object, error) {
 		case v3.ProjectGroupVersionKind.Kind:
 			project := obj.(*v3.Project)
 
-			if v3.ProjectConditionInitialRolesPopulated.IsTrue(project) {
+			if v32.ProjectConditionInitialRolesPopulated.IsTrue(project) {
 				// The projectRoleBindings are already completed, no need to check
 				break
 			}
@@ -341,7 +390,7 @@ func (m *mgr) reconcileCreatorRTB(obj runtime.Object) (runtime.Object, error) {
 			project.Annotations[roleTemplatesRequired] = string(d)
 
 			if reflect.DeepEqual(roleMap["required"], createdRoles) {
-				v3.ProjectConditionInitialRolesPopulated.True(project)
+				v32.ProjectConditionInitialRolesPopulated.True(project)
 				logrus.Infof("[%v] Setting InitialRolesPopulated condition on project %v", ctrbMGMTController, project.Name)
 			}
 			if _, err := m.mgmt.Management.Projects("").Update(project); err != nil {
@@ -351,7 +400,7 @@ func (m *mgr) reconcileCreatorRTB(obj runtime.Object) (runtime.Object, error) {
 		case v3.ClusterGroupVersionKind.Kind:
 			cluster := obj.(*v3.Cluster)
 
-			if v3.ClusterConditionInitialRolesPopulated.IsTrue(cluster) {
+			if v32.ClusterConditionInitialRolesPopulated.IsTrue(cluster) {
 				// The clusterRoleBindings are already completed, no need to check
 				break
 			}
@@ -383,7 +432,7 @@ func (m *mgr) reconcileCreatorRTB(obj runtime.Object) (runtime.Object, error) {
 					Name:      rtbName,
 					Namespace: metaAccessor.GetName(),
 				}
-				om.Annotations = crtbCeatorOwnerAnnotations
+				om.Annotations = crtbCreatorOwnerAnnotations
 
 				logrus.Infof("[%v] Creating creator clusterRoleTemplateBinding for user %v for cluster %v", projectCreateController, creatorID, metaAccessor.GetName())
 				if _, err := m.mgmt.Management.ClusterRoleTemplateBindings(metaAccessor.GetName()).Create(&v3.ClusterRoleTemplateBinding{
@@ -422,13 +471,13 @@ func (m *mgr) deleteNamespace(obj runtime.Object, controller string) error {
 	}
 
 	nsClient := m.mgmt.K8sClient.CoreV1().Namespaces()
-	ns, err := nsClient.Get(o.GetName(), v1.GetOptions{})
+	ns, err := nsClient.Get(context.TODO(), o.GetName(), v1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	if ns.Status.Phase != v12.NamespaceTerminating {
 		logrus.Infof("[%v] Deleting namespace %v", controller, o.GetName())
-		err = nsClient.Delete(o.GetName(), nil)
+		err = nsClient.Delete(context.TODO(), o.GetName(), v1.DeleteOptions{})
 		if apierrors.IsNotFound(err) {
 			return nil
 		}
@@ -437,7 +486,7 @@ func (m *mgr) deleteNamespace(obj runtime.Object, controller string) error {
 }
 
 func (m *mgr) reconcileResourceToNamespace(obj runtime.Object, controller string) (runtime.Object, error) {
-	return v3.NamespaceBackedResource.Do(obj, func() (runtime.Object, error) {
+	return v32.NamespaceBackedResource.Do(obj, func() (runtime.Object, error) {
 		o, err := meta.Accessor(obj)
 		if err != nil {
 			return obj, condition.Error("MissingMetadata", err)
@@ -451,14 +500,14 @@ func (m *mgr) reconcileResourceToNamespace(obj runtime.Object, controller string
 		if ns == nil {
 			nsClient := m.mgmt.K8sClient.CoreV1().Namespaces()
 			logrus.Infof("[%v] Creating namespace %v", controller, o.GetName())
-			_, err := nsClient.Create(&v12.Namespace{
+			_, err := nsClient.Create(context.TODO(), &v12.Namespace{
 				ObjectMeta: v1.ObjectMeta{
 					Name: o.GetName(),
 					Annotations: map[string]string{
 						"management.cattle.io/system-namespace": "true",
 					},
 				},
-			})
+			}, v1.CreateOptions{})
 			if err != nil {
 				return obj, condition.Error("NamespaceCreationFailure", errors.Wrapf(err, "failed to create namespace for %v %v", t.GetKind(), o.GetName()))
 			}
@@ -486,20 +535,42 @@ func (m *mgr) addRTAnnotation(obj runtime.Object, context string) (runtime.Objec
 
 	annoMap := make(map[string][]string)
 
+	var restrictedAdmin bool
+	if settings.RestrictedDefaultAdmin.Get() == "true" {
+		restrictedAdmin = true
+	}
+
+	annoMap["created"] = []string{}
+	annoMap["required"] = []string{}
+
 	switch context {
 	case "project":
+		// If we are in restricted mode, ensure the default projects are not granting
+		// permissions to the restricted-admin
+		if restrictedAdmin {
+			proj := obj.(*v3.Project)
+			if proj.Spec.ClusterName == "local" && (proj.Spec.DisplayName == "Default" || proj.Spec.DisplayName == "System") {
+				break
+			}
+		}
+
 		for _, role := range rt {
 			if role.ProjectCreatorDefault && !role.Locked {
 				annoMap["required"] = append(annoMap["required"], role.Name)
 			}
 		}
 	case "cluster":
+		// If we are in restricted mode, ensure we don't give the default restricted-admin
+		// the default permissions in the cluster
+		if restrictedAdmin && meta.GetName() == "local" {
+			break
+		}
+
 		for _, role := range rt {
 			if role.ClusterCreatorDefault && !role.Locked {
 				annoMap["required"] = append(annoMap["required"], role.Name)
 			}
 		}
-		annoMap["created"] = []string{}
 	}
 
 	d, err := json.Marshal(annoMap)
@@ -508,8 +579,10 @@ func (m *mgr) addRTAnnotation(obj runtime.Object, context string) (runtime.Objec
 	}
 
 	// Save the required role templates to the annotation on the obj
+	if meta.GetAnnotations() == nil {
+		meta.SetAnnotations(make(map[string]string))
+	}
 	meta.GetAnnotations()[roleTemplatesRequired] = string(d)
-
 	return obj, nil
 }
 
@@ -524,7 +597,7 @@ func (m *mgr) updateClusterAnnotationandCondition(cluster *v3.Cluster, anno stri
 		c.Annotations[roleTemplatesRequired] = anno
 
 		if updateCondition {
-			v3.ClusterConditionInitialRolesPopulated.True(c)
+			v32.ClusterConditionInitialRolesPopulated.True(c)
 		}
 		_, err = m.mgmt.Management.Clusters("").Update(c)
 		if err != nil {

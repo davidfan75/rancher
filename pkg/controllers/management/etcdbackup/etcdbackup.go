@@ -1,21 +1,33 @@
 package etcdbackup
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"time"
 
+	v32 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+
+	rketypes "github.com/rancher/rke/types"
+
 	minio "github.com/minio/minio-go"
 	"github.com/minio/minio-go/pkg/credentials"
-	"github.com/rancher/kontainer-engine/drivers/rke"
-	"github.com/rancher/kontainer-engine/service"
 	"github.com/rancher/rancher/pkg/controllers/management/clusterprovisioner"
+	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/kontainer-engine/drivers/rke"
+	"github.com/rancher/rancher/pkg/kontainer-engine/service"
 	"github.com/rancher/rancher/pkg/rkedialerfactory"
-	"github.com/rancher/rancher/pkg/ticker"
-	v1 "github.com/rancher/types/apis/core/v1"
-	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
-	"github.com/rancher/types/config"
+	"github.com/rancher/rancher/pkg/types/config"
+	"github.com/rancher/rancher/pkg/types/config/dialer"
+	"github.com/rancher/wrangler/pkg/ticker"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,6 +38,7 @@ import (
 
 const (
 	clusterBackupCheckInterval = 5 * time.Minute
+	compressedExtension        = "zip"
 	s3Endpoint                 = "s3.amazonaws.com"
 )
 
@@ -36,7 +49,6 @@ type Controller struct {
 	backupClient          v3.EtcdBackupInterface
 	backupLister          v3.EtcdBackupLister
 	backupDriver          *service.EngineService
-	secretsClient         v1.SecretInterface
 	KontainerDriverLister v3.KontainerDriverLister
 }
 
@@ -48,16 +60,17 @@ func Register(ctx context.Context, management *config.ManagementContext) {
 		backupClient:          management.Management.EtcdBackups(""),
 		backupLister:          management.Management.EtcdBackups("").Controller().Lister(),
 		backupDriver:          service.NewEngineService(clusterprovisioner.NewPersistentStore(management.Core.Namespaces(""), management.Core)),
-		secretsClient:         management.Core.Secrets(""),
 		KontainerDriverLister: management.Management.KontainerDrivers("").Controller().Lister(),
 	}
 
 	local := &rkedialerfactory.RKEDialerFactory{
 		Factory: management.Dialer,
+		Ctx:     ctx,
 	}
 	docker := &rkedialerfactory.RKEDialerFactory{
 		Factory: management.Dialer,
 		Docker:  true,
+		Ctx:     ctx,
 	}
 	driver := service.Drivers[service.RancherKubernetesEngineDriverName]
 	rkeDriver := driver.(*rke.Driver)
@@ -70,7 +83,7 @@ func Register(ctx context.Context, management *config.ManagementContext) {
 }
 
 func (c *Controller) Create(b *v3.EtcdBackup) (runtime.Object, error) {
-	if v3.BackupConditionCompleted.IsFalse(b) || v3.BackupConditionCompleted.IsTrue(b) {
+	if rketypes.BackupConditionCompleted.IsFalse(b) || rketypes.BackupConditionCompleted.IsTrue(b) {
 		return b, nil
 	}
 
@@ -83,12 +96,12 @@ func (c *Controller) Create(b *v3.EtcdBackup) (runtime.Object, error) {
 		return b, fmt.Errorf("[etcd-backup] cluster doesn't have a backup config")
 	}
 
-	if !v3.BackupConditionCreated.IsTrue(b) {
-		b.Spec.Filename = getBackupFilename(b.Name, cluster)
+	if !rketypes.BackupConditionCreated.IsTrue(b) {
+		b.Spec.Filename = generateBackupFilename(b.Name, cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig)
 		b.Spec.BackupConfig = *cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig
-		v3.BackupConditionCreated.True(b)
+		rketypes.BackupConditionCreated.True(b)
 		// we set ConditionCompleted to Unknown to avoid incorrect "active" state
-		v3.BackupConditionCompleted.Unknown(b)
+		rketypes.BackupConditionCompleted.Unknown(b)
 		b, err = c.backupClient.Update(b)
 		if err != nil {
 			return b, err
@@ -107,24 +120,9 @@ func (c *Controller) Create(b *v3.EtcdBackup) (runtime.Object, error) {
 }
 
 func (c *Controller) Remove(b *v3.EtcdBackup) (runtime.Object, error) {
-	logrus.Infof("[etcd-backup] Deleteing backup %s ", b.Name)
+	logrus.Infof("[etcd-backup] Deleting backup %s ", b.Name)
 	if err := c.etcdRemoveSnapshotWithBackoff(b); err != nil {
 		logrus.Warnf("giving up on deleting backup [%s]: %v", b.Name, err)
-	}
-	if b.Spec.BackupConfig.S3BackupConfig == nil {
-		return b, nil
-	}
-	// try to remove from s3 for 3 times, then give up. if we don't we get stuck forever
-	var delErr error
-	for i := 0; i < 3; i++ {
-		if delErr = c.deleteS3Snapshot(b); delErr == nil {
-			break
-		}
-		logrus.Warnf("failed to delete backup from s3: %v", delErr)
-		time.Sleep(5 * time.Second)
-	}
-	if delErr != nil {
-		logrus.Warnf("giving up on deleting backup [%s] from s3: %v", b.Name, delErr)
 	}
 	return b, nil
 }
@@ -184,8 +182,8 @@ func (c *Controller) doClusterBackupSync(cluster *v3.Cluster) error {
 
 	// this cluster has backups, lets see if the last one is old enough
 	// a new backup is due if this is true
-	internvalHours := cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig.IntervalHours
-	backupIntervalHours := time.Duration(internvalHours) * time.Hour
+	intervalHours := cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig.IntervalHours
+	backupIntervalHours := time.Duration(intervalHours) * time.Hour
 
 	if time.Since(getBackupCompletedTime(newestBackup)) > backupIntervalHours {
 		newBackup, err := c.createNewBackup(cluster)
@@ -200,8 +198,11 @@ func (c *Controller) doClusterBackupSync(cluster *v3.Cluster) error {
 }
 
 func (c *Controller) createNewBackup(cluster *v3.Cluster) (*v3.EtcdBackup, error) {
-	newBackup := NewBackupObject(cluster, false)
-	v3.BackupConditionCreated.CreateUnknownIfNotExists(newBackup)
+	newBackup, err := NewBackupObject(cluster, false)
+	if err != nil {
+		return nil, err
+	}
+	rketypes.BackupConditionCreated.CreateUnknownIfNotExists(newBackup)
 	return c.backupClient.Create(newBackup)
 
 }
@@ -213,14 +214,15 @@ func (c *Controller) etcdSaveWithBackoff(b *v3.EtcdBackup) (runtime.Object, erro
 		return b, err
 	}
 
-	bObj, err := v3.BackupConditionCompleted.Do(b, func() (runtime.Object, error) {
+	snapshotName := clusterprovisioner.GetBackupFilename(b)
+	bObj, err := rketypes.BackupConditionCompleted.Do(b, func() (runtime.Object, error) {
 		cluster, err := c.clusterClient.Get(b.Spec.ClusterID, metav1.GetOptions{})
 		if err != nil {
 			return b, err
 		}
 		var inErr error
 		err = wait.ExponentialBackoff(backoff, func() (bool, error) {
-			if inErr = c.backupDriver.ETCDSave(c.ctx, cluster.Name, kontainerDriver, cluster.Spec, b.Name); inErr != nil {
+			if inErr = c.backupDriver.ETCDSave(c.ctx, cluster.Name, kontainerDriver, cluster.Spec, snapshotName); inErr != nil {
 				logrus.Warnf("%v", inErr)
 				return false, nil
 			}
@@ -230,8 +232,8 @@ func (c *Controller) etcdSaveWithBackoff(b *v3.EtcdBackup) (runtime.Object, erro
 		return b, inErr
 	})
 	if err != nil {
-		v3.BackupConditionCompleted.False(bObj)
-		v3.BackupConditionCompleted.ReasonAndMessageFromError(bObj, err)
+		rketypes.BackupConditionCompleted.False(bObj)
+		rketypes.BackupConditionCompleted.ReasonAndMessageFromError(bObj, err)
 		return bObj, err
 	}
 	return bObj, nil
@@ -248,8 +250,9 @@ func (c *Controller) etcdRemoveSnapshotWithBackoff(b *v3.EtcdBackup) error {
 	if err != nil {
 		return err
 	}
+	snapshotName := clusterprovisioner.GetBackupFilename(b)
 	return wait.ExponentialBackoff(backoff, func() (bool, error) {
-		if inErr := c.backupDriver.ETCDRemoveSnapshot(c.ctx, cluster.Name, kontainerDriver, cluster.Spec, b.Name); inErr != nil {
+		if inErr := c.backupDriver.ETCDRemoveSnapshot(c.ctx, cluster.Name, kontainerDriver, cluster.Spec, snapshotName); inErr != nil {
 			logrus.Warnf("%v", inErr)
 			return false, nil
 		}
@@ -259,8 +262,8 @@ func (c *Controller) etcdRemoveSnapshotWithBackoff(b *v3.EtcdBackup) error {
 
 func (c *Controller) rotateExpiredBackups(cluster *v3.Cluster, clusterBackups []*v3.EtcdBackup) error {
 	retention := cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig.Retention
-	internvalHours := cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig.IntervalHours
-	expiredBackups := getExpiredBackups(retention, internvalHours, clusterBackups)
+	intervalHours := cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig.IntervalHours
+	expiredBackups := getExpiredBackups(retention, intervalHours, clusterBackups)
 	for _, backup := range expiredBackups {
 		if backup.Spec.Manual {
 			continue
@@ -272,7 +275,7 @@ func (c *Controller) rotateExpiredBackups(cluster *v3.Cluster, clusterBackups []
 	return nil
 }
 
-func NewBackupObject(cluster *v3.Cluster, manual bool) *v3.EtcdBackup {
+func NewBackupObject(cluster *v3.Cluster, manual bool) (*v3.EtcdBackup, error) {
 	controller := true
 	typeFlag := "r"     // recurring is the default
 	providerFlag := "l" // local is the default
@@ -284,6 +287,12 @@ func NewBackupObject(cluster *v3.Cluster, manual bool) *v3.EtcdBackup {
 		providerFlag = "s" // s3 backup
 	}
 	prefix := fmt.Sprintf("%s-%s%s-", cluster.Name, typeFlag, providerFlag)
+
+	compressedCluster, err := CompressCluster(cluster)
+	if err != nil {
+		return nil, err
+	}
+
 	return &v3.EtcdBackup{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:    cluster.Name,
@@ -298,64 +307,133 @@ func NewBackupObject(cluster *v3.Cluster, manual bool) *v3.EtcdBackup {
 				},
 			},
 		},
-		Spec: v3.EtcdBackupSpec{
+		Spec: rketypes.EtcdBackupSpec{
 			ClusterID: cluster.Name,
 			Manual:    manual,
 		},
-	}
+		Status: rketypes.EtcdBackupStatus{
+			KubernetesVersion: cluster.Spec.RancherKubernetesEngineConfig.Version,
+			ClusterObject:     compressedCluster,
+		},
+	}, nil
 }
 
-func getBackupFilename(snapshotName string, cluster *v3.Cluster) string {
-	if cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig == nil ||
-		cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig.S3BackupConfig == nil {
+func CompressCluster(cluster *v3.Cluster) (string, error) {
+	jsonCluster, err := json.Marshal(cluster)
+	if err != nil {
+		return "", err
+	}
+
+	var gzCluster bytes.Buffer
+	gz := gzip.NewWriter(&gzCluster)
+	defer gz.Close()
+
+	_, err = gz.Write([]byte(jsonCluster))
+	if err != nil {
+		return "", err
+	}
+
+	if err := gz.Close(); err != nil {
+		return "", err
+	}
+
+	return base64.StdEncoding.EncodeToString(gzCluster.Bytes()), nil
+}
+
+func DecompressCluster(cluster string) (*v3.Cluster, error) {
+	clusterGzip, err := base64.StdEncoding.DecodeString(cluster)
+	if err != nil {
+		return nil, fmt.Errorf("error base64.DecodeString: %v", err)
+	}
+
+	buffer := bytes.NewBuffer(clusterGzip)
+
+	var gz io.Reader
+	gz, err = gzip.NewReader(buffer)
+	if err != nil {
+		return nil, err
+	}
+
+	var clusterJSON bytes.Buffer
+	_, err = io.Copy(&clusterJSON, gz)
+	if err != nil {
+		return nil, err
+	}
+
+	c := v3.Cluster{}
+	err = json.Unmarshal(clusterJSON.Bytes(), &c)
+	if err != nil {
+		return nil, err
+	}
+
+	return &c, nil
+}
+
+func generateBackupFilename(snapshotName string, backupConfig *rketypes.BackupConfig) string {
+	// no backup config
+	if backupConfig == nil {
 		return ""
 	}
-	target := cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig.S3BackupConfig
-	return fmt.Sprintf("https://s3.%s.amazonaws.com/%s/%s", target.Region, target.BucketName, snapshotName)
+	filename := fmt.Sprintf("%s_%s.%s", snapshotName, time.Now().Format(time.RFC3339), compressedExtension)
+	if backupConfig.SafeTimestamp {
+		filename = strings.ReplaceAll(filename, ":", "-")
+	}
+	// s3 backup
+	if backupConfig != nil &&
+		backupConfig.S3BackupConfig != nil {
+		if len(backupConfig.S3BackupConfig.Folder) != 0 {
+			return fmt.Sprintf("https://%s/%s/%s/%s", backupConfig.S3BackupConfig.Endpoint, backupConfig.S3BackupConfig.BucketName, backupConfig.S3BackupConfig.Folder, filename)
+		}
+		return fmt.Sprintf("https://%s/%s/%s", backupConfig.S3BackupConfig.Endpoint, backupConfig.S3BackupConfig.BucketName, filename)
+	}
+	// local backup
+	return filename
+
 }
 
-func (c *Controller) deleteS3Snapshot(b *v3.EtcdBackup) error {
-	if b.Spec.BackupConfig.S3BackupConfig == nil {
-		return fmt.Errorf("can't find S3 backup target configuration")
+func GetS3Client(sbc *rketypes.S3BackupConfig, timeout int, dialer dialer.Dialer) (*minio.Client, error) {
+	if sbc == nil {
+		return nil, fmt.Errorf("Can't find S3 backup target configuration")
 	}
-	var err error
 	var s3Client = &minio.Client{}
-	var creds = &credentials.Credentials{}
-	endpoint := b.Spec.BackupConfig.S3BackupConfig.Endpoint
-	bucketLookup := getBucketLookupType(endpoint)
-	bucket := b.Spec.BackupConfig.S3BackupConfig.BucketName
+	var creds *credentials.Credentials
+	var tr http.RoundTripper = &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	endpoint := sbc.Endpoint
 	// no access credentials, we assume IAM roles
-	if b.Spec.BackupConfig.S3BackupConfig.AccessKey == "" ||
-		b.Spec.BackupConfig.S3BackupConfig.SecretKey == "" {
+	if sbc.AccessKey == "" ||
+		sbc.SecretKey == "" {
 		creds = credentials.NewIAM("")
-		if b.Spec.BackupConfig.S3BackupConfig.Endpoint == "" {
+		if sbc.Endpoint == "" {
 			endpoint = s3Endpoint
 		}
 	} else {
-		accessKey := b.Spec.BackupConfig.S3BackupConfig.AccessKey
-		secretKey := b.Spec.BackupConfig.S3BackupConfig.SecretKey
+		accessKey := sbc.AccessKey
+		secretKey := sbc.SecretKey
 		creds = credentials.NewStatic(accessKey, secretKey, "", credentials.SignatureDefault)
 	}
-	s3Client, err = minio.NewWithOptions(endpoint, &minio.Options{
+
+	bucketLookup := getBucketLookupType(endpoint)
+	s3Client, err := minio.NewWithOptions(endpoint, &minio.Options{
 		Creds:        creds,
-		Region:       b.Spec.BackupConfig.S3BackupConfig.Region,
+		Region:       sbc.Region,
 		Secure:       true,
 		BucketLookup: bucketLookup,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	exists, err := s3Client.BucketExists(bucket)
-	if err != nil {
-		return fmt.Errorf("can't access bucket: %v", err)
+	if sbc.CustomCA != "" {
+		tr = getCustomCATransport(tr, sbc.CustomCA)
 	}
-	if !exists {
-		logrus.Errorf("bucket %s doesn't exist", bucket)
-		return nil
-	}
-
-	return s3Client.RemoveObject(bucket, b.Name)
+	s3Client.SetCustomTransport(tr)
+	return s3Client, nil
 }
 
 func (c *Controller) getRecuringBackupsList(cluster *v3.Cluster) ([]*v3.EtcdBackup, error) {
@@ -383,13 +461,13 @@ func getBucketLookupType(endpoint string) minio.BucketLookupType {
 }
 
 func getBackupCompletedTime(o runtime.Object) time.Time {
-	t, _ := time.Parse(time.RFC3339, v3.BackupConditionCompleted.GetLastUpdated(o))
+	t, _ := time.Parse(time.RFC3339, rketypes.BackupConditionCompleted.GetLastUpdated(o))
 	return t
 }
 
-func getExpiredBackups(retention, internvalHours int, backups []*v3.EtcdBackup) []*v3.EtcdBackup {
+func getExpiredBackups(retention, intervalHours int, backups []*v3.EtcdBackup) []*v3.EtcdBackup {
 	expiredList := []*v3.EtcdBackup{}
-	toKeepDuration := time.Duration(retention*internvalHours) * time.Hour
+	toKeepDuration := time.Duration(retention*intervalHours) * time.Hour
 	for _, backup := range backups {
 		if time.Since(getBackupCompletedTime(backup)) > toKeepDuration {
 			expiredList = append(expiredList, backup)
@@ -410,7 +488,7 @@ func shouldBackup(cluster *v3.Cluster) bool {
 		return false
 	}
 	// we only work with ready clusters
-	if !v3.ClusterConditionReady.IsTrue(cluster) {
+	if !v32.ClusterConditionReady.IsTrue(cluster) {
 		return false
 	}
 
@@ -430,11 +508,20 @@ func getBackoff() wait.Backoff {
 	}
 }
 
-func isBackupSet(rkeConfig *v3.RancherKubernetesEngineConfig) bool {
+func isBackupSet(rkeConfig *rketypes.RancherKubernetesEngineConfig) bool {
 	return rkeConfig != nil && // rke cluster
 		rkeConfig.Services.Etcd.BackupConfig != nil // backupConfig is set
 }
 
-func isRecurringBackupEnabled(rkeConfig *v3.RancherKubernetesEngineConfig) bool {
-	return isBackupSet(rkeConfig) && *rkeConfig.Services.Etcd.BackupConfig.Enabled
+func isRecurringBackupEnabled(rkeConfig *rketypes.RancherKubernetesEngineConfig) bool {
+	return isBackupSet(rkeConfig) && rkeConfig.Services.Etcd.BackupConfig.Enabled != nil && *rkeConfig.Services.Etcd.BackupConfig.Enabled
+}
+
+func getCustomCATransport(tr http.RoundTripper, ca string) http.RoundTripper {
+	certPool := x509.NewCertPool()
+	certPool.AppendCertsFromPEM([]byte(ca))
+	tr.(*http.Transport).TLSClientConfig = &tls.Config{
+		RootCAs: certPool,
+	}
+	return tr
 }

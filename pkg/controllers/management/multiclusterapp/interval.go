@@ -2,12 +2,13 @@ package multiclusterapp
 
 import (
 	"context"
-	"github.com/rancher/rancher/pkg/namespace"
-	"github.com/rancher/rancher/pkg/ticker"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	"github.com/sirupsen/logrus"
 	"sync"
 	"time"
+
+	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/namespace"
+	"github.com/rancher/wrangler/pkg/ticker"
+	"github.com/sirupsen/logrus"
 )
 
 type IntervalData struct {

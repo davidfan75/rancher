@@ -119,6 +119,7 @@ export CATTLE_SERVER
 export CATTLE_TOKEN
 export CATTLE_NODE_LABEL
 export CATTLE_WRITE_CERT_ONLY
+export CATTLE_NODE_TAINTS
 
 while true; do
     case "$1" in
@@ -136,6 +137,7 @@ while true; do
         -i | --internal-address) shift; CATTLE_INTERNAL_ADDRESS=$1  ;;
         -l | --label)            shift; CATTLE_NODE_LABEL+=",$1"    ;;
         -o | --only-write-certs)        CATTLE_WRITE_CERT_ONLY=true ;;
+        --taints)                shift; CATTLE_NODE_TAINTS+=",$1"   ;;
         *) break;
     esac
     shift
@@ -213,6 +215,7 @@ fi
 
 # Extract hostname from URL
 CATTLE_SERVER_HOSTNAME=$(echo $CATTLE_SERVER | sed -e 's/[^/]*\/\/\([^@]*@\)\?\([^:/]*\).*/\2/')
+CATTLE_SERVER_HOSTNAME_WITH_PORT=$(echo $CATTLE_SERVER | sed -e 's/[^/]*\/\/\([^@]*@\)\?\(.*\).*/\2/')
 # Resolve IPv4 address(es) from hostname
 RESOLVED_ADDR=$(getent ahostsv4 $CATTLE_SERVER_HOSTNAME | sed -n 's/ *STREAM.*//p')
 
@@ -246,6 +249,12 @@ if [ -n "$CATTLE_CA_CHECKSUM" ]; then
     else
         mkdir -p /etc/kubernetes/ssl/certs
         mv $temp /etc/kubernetes/ssl/certs/serverca
+        chmod 755 /etc/kubernetes/ssl
+        chmod 700 /etc/kubernetes/ssl/certs
+        chmod 600 /etc/kubernetes/ssl/certs/serverca
+        mkdir -p /etc/docker/certs.d/$CATTLE_SERVER_HOSTNAME_WITH_PORT
+        cp /etc/kubernetes/ssl/certs/serverca /etc/docker/certs.d/$CATTLE_SERVER_HOSTNAME_WITH_PORT/ca.crt
+
     fi
 fi
 

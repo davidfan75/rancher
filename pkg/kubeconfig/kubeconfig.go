@@ -7,9 +7,9 @@ import (
 	"regexp"
 
 	"github.com/rancher/norman/types/slice"
+	managementv3 "github.com/rancher/rancher/pkg/client/generated/management/v3"
 	"github.com/rancher/rancher/pkg/settings"
 	"github.com/rancher/rke/services"
-	managementv3 "github.com/rancher/types/client/management/v3"
 )
 
 const (
@@ -29,15 +29,16 @@ type node struct {
 }
 
 type data struct {
-	ClusterName string
-	Host        string
-	ClusterID   string
-	Cert        string
-	User        string
-	Username    string
-	Password    string
-	Token       string
-	Nodes       []node
+	ClusterName     string
+	Host            string
+	ClusterID       string
+	Cert            string
+	User            string
+	Username        string
+	Password        string
+	Token           string
+	EndpointEnabled bool
+	Nodes           []node
 }
 
 func ForBasic(host, username, password string) (string, error) {
@@ -85,24 +86,25 @@ func caCertString() string {
 	return formatCertString(certData)
 }
 
-func getDefaultNode(clusterName, clusterID, host, username string) node {
+func getDefaultNode(clusterName, clusterID, host string) node {
 	return node{
 		Server:      fmt.Sprintf("https://%s/k8s/clusters/%s", host, clusterID),
 		Cert:        caCertString(),
 		ClusterName: clusterName,
-		User:        username,
+		User:        clusterName,
 	}
 }
 
-func ForTokenBased(clusterName, clusterID, host, username, token string) (string, error) {
+func ForTokenBased(clusterName, clusterID, host, token string) (string, error) {
 	data := &data{
-		ClusterName: clusterName,
-		ClusterID:   clusterID,
-		Host:        host,
-		Cert:        caCertString(),
-		User:        username,
-		Token:       token,
-		Nodes:       []node{getDefaultNode(clusterName, clusterID, host, username)},
+		ClusterName:     clusterName,
+		ClusterID:       clusterID,
+		Host:            host,
+		Cert:            caCertString(),
+		User:            clusterName,
+		Token:           token,
+		Nodes:           []node{getDefaultNode(clusterName, clusterID, host)},
+		EndpointEnabled: false,
 	}
 
 	if data.ClusterName == "" {
@@ -114,16 +116,21 @@ func ForTokenBased(clusterName, clusterID, host, username, token string) (string
 	return buf.String(), err
 }
 
-func ForClusterTokenBased(cluster *managementv3.Cluster, clusterID, host, username, token string) (string, error) {
-	nodes := []node{getDefaultNode(cluster.Name, clusterID, host, username)}
+func ForClusterTokenBased(cluster *managementv3.Cluster, clusterID, host, token string) (string, error) {
+	clusterName := cluster.Name
+	if clusterName == "" {
+		clusterName = clusterID
+	}
+
+	nodes := []node{getDefaultNode(clusterName, clusterID, host)}
 
 	if cluster.LocalClusterAuthEndpoint.FQDN != "" {
 		fqdnCACerts := base64.StdEncoding.EncodeToString([]byte(cluster.LocalClusterAuthEndpoint.CACerts))
 		clusterNode := node{
-			ClusterName: cluster.Name + "-fqdn",
+			ClusterName: clusterName + "-fqdn",
 			Server:      "https://" + cluster.LocalClusterAuthEndpoint.FQDN,
 			Cert:        formatCertString(fqdnCACerts),
-			User:        username,
+			User:        clusterName,
 		}
 		nodes = append(nodes, clusterNode)
 	} else {
@@ -136,27 +143,24 @@ func ForClusterTokenBased(cluster *managementv3.Cluster, clusterID, host, userna
 				continue
 			}
 			clusterNode := node{
-				ClusterName: cluster.Name + "-" + rkeNode.HostnameOverride,
+				ClusterName: clusterName + "-" + rkeNode.HostnameOverride,
 				Server:      "https://" + rkeNode.Address + ":6443",
 				Cert:        formatCertString(cluster.CACert),
-				User:        username,
+				User:        clusterName,
 			}
 			nodes = append(nodes, clusterNode)
 		}
 	}
 
 	data := &data{
-		ClusterName: cluster.Name,
-		ClusterID:   clusterID,
-		Host:        host,
-		Cert:        caCertString(),
-		User:        username,
-		Token:       token,
-		Nodes:       nodes,
-	}
-
-	if data.ClusterName == "" {
-		data.ClusterName = data.ClusterID
+		ClusterName:     clusterName,
+		ClusterID:       clusterID,
+		Host:            host,
+		Cert:            caCertString(),
+		User:            clusterName,
+		Token:           token,
+		Nodes:           nodes,
+		EndpointEnabled: true,
 	}
 
 	buf := &bytes.Buffer{}

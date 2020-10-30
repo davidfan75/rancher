@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 )
 
 const (
-	statusAnn       = "cattle.io/status"
-	GlobalNamespace = "cattle-global-data"
+	statusAnn                   = "cattle.io/status"
+	System                      = "cattle-system"
+	GlobalNamespace             = "cattle-global-data"
+	NodeTemplateGlobalNamespace = "cattle-global-nt"
 )
 
 func SetNamespaceCondition(namespace *v1.Namespace, d time.Duration, conditionType string, conditionStatus bool, message string) error {

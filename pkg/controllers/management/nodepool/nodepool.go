@@ -3,18 +3,21 @@ package nodepool
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
-	"reflect"
+	v32 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 
+	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/ref"
+	"github.com/rancher/rancher/pkg/types/config"
 	"github.com/rancher/rke/services"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	"github.com/rancher/types/config"
 	"github.com/sirupsen/logrus"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -30,6 +33,8 @@ type Controller struct {
 	NodePools          v3.NodePoolInterface
 	NodeLister         v3.NodeLister
 	Nodes              v3.NodeInterface
+	mutex              sync.RWMutex
+	syncmap            map[string]bool
 }
 
 func Register(ctx context.Context, management *config.ManagementContext) {
@@ -39,6 +44,7 @@ func Register(ctx context.Context, management *config.ManagementContext) {
 		NodePools:          management.Management.NodePools(""),
 		NodeLister:         management.Management.Nodes("").Controller().Lister(),
 		Nodes:              management.Management.Nodes(""),
+		syncmap:            make(map[string]bool),
 	}
 
 	// Add handlers
@@ -51,8 +57,8 @@ func (c *Controller) Create(nodePool *v3.NodePool) (runtime.Object, error) {
 }
 
 func (c *Controller) Updated(nodePool *v3.NodePool) (runtime.Object, error) {
-	obj, err := v3.NodePoolConditionUpdated.Do(nodePool, func() (runtime.Object, error) {
-		return nodePool, c.createNodes(nodePool)
+	obj, err := v32.NodePoolConditionUpdated.Do(nodePool, func() (runtime.Object, error) {
+		return nodePool, c.reconcile(nodePool)
 	})
 	return obj.(*v3.NodePool), err
 }
@@ -105,7 +111,7 @@ func (c *Controller) createNode(name string, nodePool *v3.NodePool, simulate boo
 			Labels:       nodePool.Labels,
 			Annotations:  nodePool.Annotations,
 		},
-		Spec: v3.NodeSpec{
+		Spec: v32.NodeSpec{
 			Etcd:              nodePool.Spec.Etcd,
 			ControlPlane:      nodePool.Spec.ControlPlane,
 			Worker:            nodePool.Spec.Worker,
@@ -140,7 +146,7 @@ func (c *Controller) deleteNode(node *v3.Node, duration time.Duration) error {
 	})
 }
 
-func (c *Controller) createNodes(nodePool *v3.NodePool) error {
+func (c *Controller) reconcile(nodePool *v3.NodePool) error {
 	changed, err := c.createOrCheckNodes(nodePool, true)
 	if err != nil {
 		return err
@@ -168,16 +174,14 @@ func (c *Controller) nodes(nodePool *v3.NodePool, simulate bool) ([]*v3.Node, er
 		return c.NodeLister.List(nodePool.Namespace, labels.Everything())
 	}
 
-	nodeList, err := c.Nodes.List(metav1.ListOptions{})
+	nodeList, err := c.Nodes.ListNamespaced(nodePool.Namespace, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 
 	var nodes []*v3.Node
 	for i := range nodeList.Items {
-		if nodeList.Items[i].Namespace == nodePool.Namespace {
-			nodes = append(nodes, &nodeList.Items[i])
-		}
+		nodes = append(nodes, &nodeList.Items[i])
 	}
 
 	return nodes, nil
@@ -185,10 +189,11 @@ func (c *Controller) nodes(nodePool *v3.NodePool, simulate bool) ([]*v3.Node, er
 
 func (c *Controller) createOrCheckNodes(nodePool *v3.NodePool, simulate bool) (bool, error) {
 	var (
-		err     error
-		byName  = map[string]*v3.Node{}
-		changed = false
-		nodes   []*v3.Node
+		err                 error
+		byName              = map[string]*v3.Node{}
+		changed             = false
+		nodes               []*v3.Node
+		deleteNotReadyAfter = nodePool.Spec.DeleteNotReadyAfterSecs * time.Second
 	)
 
 	allNodes, err := c.nodes(nodePool, simulate)
@@ -204,13 +209,34 @@ func (c *Controller) createOrCheckNodes(nodePool *v3.NodePool, simulate bool) (b
 			continue
 		}
 
-		if v3.NodeConditionProvisioned.IsFalse(node) || v3.NodeConditionInitialized.IsFalse(node) || v3.NodeConditionConfigSaved.IsFalse(node) {
+		if v32.NodeConditionProvisioned.IsFalse(node) || v32.NodeConditionInitialized.IsFalse(node) || v32.NodeConditionConfigSaved.IsFalse(node) {
 			changed = true
 			if !simulate {
-				c.deleteNode(node, 2*time.Minute)
+				_ = c.deleteNode(node, 2*time.Minute)
 			}
 		}
-
+		// remove unreachable node with the unreachable taint & status of Ready being Unknown
+		q := getUnreachableTaint(node.Spec.InternalNodeSpec.Taints)
+		if q != nil && deleteNotReadyAfter > 0 {
+			changed = true
+			if isNodeReadyUnknown(node) && !simulate {
+				start := q.TimeAdded.Time
+				if time.Since(start) > deleteNotReadyAfter {
+					err = c.deleteNode(node, 0)
+					if err != nil {
+						return false, err
+					}
+				} else {
+					c.mutex.Lock()
+					nodeid := node.Namespace + ":" + node.Name
+					if _, ok := c.syncmap[nodeid]; !ok {
+						c.syncmap[nodeid] = true
+						go c.requeue(deleteNotReadyAfter, nodePool, node)
+					}
+					c.mutex.Unlock()
+				}
+			}
+		}
 		nodes = append(nodes, node)
 	}
 
@@ -243,9 +269,7 @@ func (c *Controller) createOrCheckNodes(nodePool *v3.NodePool, simulate bool) (b
 	}
 
 	for len(nodes) > quantity {
-		sort.Slice(nodes, func(i, j int) bool {
-			return nodes[i].Spec.RequestedHostname < nodes[j].Spec.RequestedHostname
-		})
+		sort.Sort(byHostname(nodes))
 
 		toDelete := nodes[len(nodes)-1]
 
@@ -280,6 +304,10 @@ func needRoleUpdate(node *v3.Node, nodePool *v3.NodePool) bool {
 	}
 
 	nodeRolesMap := map[string]bool{}
+	nodeRolesMap[services.ETCDRole] = false
+	nodeRolesMap[services.ControlRole] = false
+	nodeRolesMap[services.WorkerRole] = false
+
 	for _, role := range node.Status.NodeConfig.Role {
 		switch r := role; r {
 		case services.ETCDRole:
@@ -290,12 +318,16 @@ func needRoleUpdate(node *v3.Node, nodePool *v3.NodePool) bool {
 			nodeRolesMap[services.WorkerRole] = true
 		}
 	}
-
 	poolRolesMap := map[string]bool{}
 	poolRolesMap[services.ETCDRole] = nodePool.Spec.Etcd
 	poolRolesMap[services.ControlRole] = nodePool.Spec.ControlPlane
 	poolRolesMap[services.WorkerRole] = nodePool.Spec.Worker
-	return !reflect.DeepEqual(nodeRolesMap, poolRolesMap)
+
+	r := !reflect.DeepEqual(nodeRolesMap, poolRolesMap)
+	if r {
+		logrus.Debugf("updating machine [%s] roles: nodepoolRoles: {%+v} node roles: {%+v}", node.Name, poolRolesMap, nodeRolesMap)
+	}
+	return r
 }
 
 func (c *Controller) updateNodeRoles(existing *v3.Node, nodePool *v3.NodePool, simulate bool) (*v3.Node, error) {
@@ -312,10 +344,54 @@ func (c *Controller) updateNodeRoles(existing *v3.Node, nodePool *v3.NodePool, s
 		newRoles = append(newRoles, "worker")
 	}
 
+	if len(newRoles) == 0 {
+		newRoles = []string{"worker"}
+	}
+
 	toUpdate.Status.NodeConfig.Role = newRoles
 	if simulate {
 		return toUpdate, nil
 	}
-
 	return c.Nodes.Update(toUpdate)
+}
+
+// requeue checks every 5 seconds if the node is still unreachable with one goroutine per node
+func (c *Controller) requeue(timeout time.Duration, np *v3.NodePool, node *v3.Node) {
+
+	t := getUnreachableTaint(node.Spec.InternalNodeSpec.Taints)
+	for t != nil {
+		time.Sleep(5 * time.Second)
+		exist, err := c.NodeLister.Get(node.Namespace, node.Name)
+		if err != nil {
+			break
+		}
+		t = getUnreachableTaint(exist.Spec.InternalNodeSpec.Taints)
+		if t != nil && time.Since(t.TimeAdded.Time) > timeout {
+			logrus.Debugf("Enqueue nodepool controller: %s %s", np.Namespace, np.Name)
+			c.NodePoolController.Enqueue(np.Namespace, np.Name)
+			break
+		}
+	}
+	c.mutex.Lock()
+	delete(c.syncmap, node.Namespace+":"+node.Name)
+	c.mutex.Unlock()
+}
+
+func getUnreachableTaint(taints []v1.Taint) *v1.Taint {
+	for _, taint := range taints {
+		if taint.Key == v1.TaintNodeUnreachable {
+			return &taint
+		}
+	}
+	return nil
+}
+
+// IsNodeReady returns true if a node Ready condition is Unknown; false otherwise.
+func isNodeReadyUnknown(node *v3.Node) bool {
+	for _, c := range node.Status.InternalNodeStatus.Conditions {
+		if c.Type == v1.NodeReady {
+			return c.Status == v1.ConditionUnknown
+		}
+	}
+	return false
 }

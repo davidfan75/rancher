@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"io"
 	"io/ioutil"
-	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -19,11 +18,14 @@ import (
 	"strings"
 	"time"
 
+	v32 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+
 	"github.com/rancher/norman/controller"
+	catUtil "github.com/rancher/rancher/pkg/catalog/utils"
+	mgmtv3 "github.com/rancher/rancher/pkg/client/generated/management/v3"
+	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
 	nsutil "github.com/rancher/rancher/pkg/namespace"
 	"github.com/rancher/rancher/pkg/settings"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	mgmtv3 "github.com/rancher/types/client/management/v3"
 
 	"github.com/blang/semver"
 	"github.com/docker/docker/pkg/locker"
@@ -32,21 +34,24 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-var httpTimeout = time.Second * 30
-var httpClient = &http.Client{
-	Timeout: httpTimeout,
-}
-var uuid = settings.InstallUUID.Get()
-var Locker = locker.New()
-
-var CatalogCache = filepath.Join("management-state", "catalog-cache")
-var IconCache = filepath.Join(CatalogCache, ".icon-cache")
+var (
+	httpTimeout = time.Second * 30
+	httpClient  = &http.Client{
+		Timeout: httpTimeout,
+	}
+	uuid            = settings.InstallUUID.Get()
+	Locker          = locker.New()
+	CatalogCache    = filepath.Join("management-state", "catalog-cache")
+	IconCache       = filepath.Join(CatalogCache, ".icon-cache")
+	InternalCatalog = filepath.Join("..", "rancher-data", "local-catalogs")
+)
 
 type Helm struct {
 	LocalPath   string
 	IconPath    string
 	catalogName string
 	Hash        string
+	Kind        string
 	url         string
 	branch      string
 	username    string
@@ -73,16 +78,31 @@ func (h *Helm) lockAndVerifyCachePath() error {
 	return nil
 }
 
-func (h *Helm) request(pathURL, method string) (*http.Response, error) {
+func (h *Helm) request(pathURL string) (*http.Response, error) {
 	baseEndpoint, err := url.Parse(pathURL)
 	if err != nil {
+		return nil, err
+	}
+	if !baseEndpoint.IsAbs() {
+		helmURLstring := h.url
+		if !strings.HasSuffix(helmURLstring, "/") {
+			helmURLstring = helmURLstring + "/"
+		}
+		helmURL, err := url.Parse(helmURLstring)
+		if err != nil {
+			return nil, err
+		}
+		baseEndpoint = helmURL.ResolveReference(baseEndpoint)
+	}
+
+	if err := catUtil.ValidateURL(baseEndpoint.String()); err != nil {
 		return nil, err
 	}
 
 	if len(h.username) > 0 && len(h.password) > 0 {
 		baseEndpoint.User = url.UserPassword(h.username, h.password)
 	}
-	req, err := http.NewRequest(method, baseEndpoint.String(), nil)
+	req, err := http.NewRequest(http.MethodGet, baseEndpoint.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +112,7 @@ func (h *Helm) request(pathURL, method string) (*http.Response, error) {
 func (h *Helm) downloadIndex(indexURL string) (*RepoIndex, error) {
 	indexURL = strings.TrimSuffix(indexURL, "/")
 	indexURL = indexURL + "/index.yaml"
-	resp, err := h.request(indexURL, "GET")
+	resp, err := h.request(indexURL)
 	if err != nil {
 		if e, ok := err.(net.Error); ok && e.Timeout() {
 			return nil, errors.Errorf("Timeout in HTTP GET to [%s], did not respond in %s", indexURL, httpTimeout)
@@ -123,8 +143,7 @@ func (h *Helm) downloadIndex(indexURL string) (*RepoIndex, error) {
 	}
 	err = yaml.Unmarshal(body, helmRepoIndex.IndexFile)
 	if err != nil {
-		logrus.Debugf("Error while parsing response from [%s], error: %s. Response: %s", indexURL, err, body)
-		return nil, errors.Errorf("Error while parsing response from [%s], error: %s", indexURL, err)
+		return nil, errors.Errorf("error unmarshalling response from [%s]", indexURL)
 	}
 	return helmRepoIndex, nil
 }
@@ -166,13 +185,19 @@ func (h *Helm) LoadIndex() (*RepoIndex, error) {
 	return helmRepoIndex, yaml.Unmarshal(body, helmRepoIndex.IndexFile)
 }
 
-func (h *Helm) fetchTgz(url string) ([]v3.File, error) {
-	var files []v3.File
+func (h *Helm) fetchTgz(helmURL string) ([]v32.File, error) {
+	var files []v32.File
+	logrus.Debugf("Helm fetching file %s", helmURL)
 
-	logrus.Debugf("Helm fetching file %s", url)
-	resp, err := h.request(url, "GET")
-	if err != nil {
-		return nil, errors.Errorf("Error in HTTP GET of [%s], error: %s", url, err)
+	resp, err := h.request(helmURL)
+	if err != nil || resp.StatusCode > 400 {
+		if e, ok := err.(net.Error); ok && e.Timeout() {
+			return nil, errors.Errorf("Timeout in HTTP GET to [%s], did not respond in %s", helmURL, httpTimeout)
+		}
+		if err == nil {
+			return nil, errors.Errorf("Error in HTTP GET of [%s], received: %s", helmURL, resp.Status)
+		}
+		return nil, errors.Errorf("Error in HTTP GET of [%s], error: %s", helmURL, err)
 	}
 	defer resp.Body.Close()
 
@@ -204,7 +229,7 @@ func (h *Helm) fetchTgz(url string) ([]v3.File, error) {
 			if err != nil {
 				return nil, err
 			}
-			files = append(files, v3.File{
+			files = append(files, v32.File{
 				Name:     name,
 				Contents: string(contents),
 			})
@@ -214,7 +239,7 @@ func (h *Helm) fetchTgz(url string) ([]v3.File, error) {
 	return files, nil
 }
 
-func (h *Helm) FetchLocalFiles(version *ChartVersion) ([]v3.File, error) {
+func (h *Helm) FetchLocalFiles(version *ChartVersion) ([]v32.File, error) {
 	err := h.lockAndVerifyCachePath()
 	defer h.unlock()
 	if err != nil {
@@ -225,7 +250,7 @@ func (h *Helm) FetchLocalFiles(version *ChartVersion) ([]v3.File, error) {
 		return nil, errors.New("No files or urls provided for helm fetch")
 	}
 
-	var files []v3.File
+	var files []v32.File
 	for _, file := range version.LocalFiles {
 		newFile, err := h.loadFile(version, file)
 		if err != nil {
@@ -264,7 +289,7 @@ func (h *Helm) loadChartFiles(versionDir, prefix string, filters []string) (map[
 	return filemap, err
 }
 
-func (h *Helm) LoadChart(templateVersion *v3.TemplateVersionSpec, filters []string) (map[string]string, error) {
+func (h *Helm) LoadChart(templateVersion *v32.TemplateVersionSpec, filters []string) (map[string]string, error) {
 	err := h.lockAndVerifyCachePath()
 	defer h.unlock()
 	if err != nil {
@@ -290,11 +315,12 @@ func (h *Helm) LoadChart(templateVersion *v3.TemplateVersionSpec, filters []stri
 
 func (h *Helm) fetchAndCacheURLs(versionPath, versionName string, versionURLs, filters []string) (map[string]string, error) {
 	filemap := map[string]string{}
-	if err := os.MkdirAll(versionPath, 0755); err != nil {
-		return nil, err
-	}
 	files, err := h.fetchURLs(versionURLs)
 	if err != nil {
+		return nil, err
+	}
+	// existence of this file indicates the cache exists
+	if err := os.MkdirAll(versionPath, 0755); err != nil {
 		return nil, err
 	}
 	for _, file := range files {
@@ -337,7 +363,7 @@ func filterMatch(match string, filters []string) bool {
 	return false
 }
 
-func (h *Helm) fetchURLs(urls []string) ([]v3.File, error) {
+func (h *Helm) fetchURLs(urls []string) ([]v32.File, error) {
 	var (
 		errs []error
 	)
@@ -351,7 +377,7 @@ func (h *Helm) fetchURLs(urls []string) ([]v3.File, error) {
 	return nil, errors.Errorf("Error fetching helm URLs: %v", errs)
 }
 
-func (h *Helm) loadFile(version *ChartVersion, filename string) (*v3.File, error) {
+func (h *Helm) loadFile(version *ChartVersion, filename string) (*v32.File, error) {
 	data, err := ioutil.ReadFile(filename)
 	if err != nil {
 		return nil, err
@@ -363,7 +389,7 @@ func (h *Helm) loadFile(version *ChartVersion, filename string) (*v3.File, error
 		return nil, err
 	}
 
-	return &v3.File{
+	return &v32.File{
 		Name:     path.Join(version.Name, filepath.ToSlash(relPath)),
 		Contents: string(data),
 	}, nil
@@ -463,19 +489,12 @@ func (h *Helm) loadCachedIcon(iconURL string) ([]byte, string, string, error) {
 	return iconBytes, cacheFile, iconURL, nil
 }
 
+// cacheIcon create the cache data & filename from the given parameters. If extension is "" then it will craft one
 func (h *Helm) cacheIcon(iconURL, extension string, iconBytes []byte) (string, error) {
-	parsedURL, err := url.Parse(iconURL)
-	var filename string
-	if err == nil {
-		filename = path.Base(parsedURL.Path)
-	} else {
-		logrus.Debugf("url.Parse(%s) error [%s]", iconURL, err)
-		parts := strings.Split(iconURL, "/")
-		filename = parts[len(parts)-1]
-	}
 	if extension == "" {
-		extension = filepath.Ext(filename)
+		extension = craftExtension(iconURL)
 	}
+
 	hashName := md5Hash(iconURL) + extension
 	if filepath.Ext(hashName) == "" {
 		logrus.Debugf("No extension for: %s", hashName)
@@ -485,6 +504,25 @@ func (h *Helm) cacheIcon(iconURL, extension string, iconBytes []byte) (string, e
 		return "", err
 	}
 	return hashName, nil
+}
+
+// craftExtension attempts to parse the given iconURL to create an appropriate extension
+func craftExtension(iconURL string) string {
+	parsedURL, err := url.Parse(iconURL)
+	var filename string
+	if err == nil {
+		if parsedURL.Path != "" {
+			filename = path.Base(parsedURL.Path)
+		} else {
+			filename = parsedURL.Host
+		}
+	} else {
+		logrus.Debugf("url.Parse(%s) error [%s]", iconURL, err)
+		parts := strings.Split(iconURL, "/")
+		filename = parts[len(parts)-1]
+	}
+	return filepath.Ext(filename)
+
 }
 
 func (h *Helm) iconFromFile(iconURL, versionDir string) ([]byte, string, string, error) {
@@ -513,55 +551,12 @@ func (h *Helm) iconFromFile(iconURL, versionDir string) ([]byte, string, string,
 	return iconBytes, cacheFile, iconURL, nil
 }
 
-func (h *Helm) iconFromHTTP(iconURL string) ([]byte, string, string, error) {
-	if iconBytes, cacheFile, iconURL, err := h.loadCachedIcon(iconURL); err == nil {
-		logrus.Debugf("Helm found cached icon %s for %s", cacheFile, iconURL)
-		return iconBytes, cacheFile, iconURL, nil
-	}
-
-	resp, err := httpClient.Get(iconURL)
-	if err != nil {
-		return nil, "", "", errors.Errorf("Icon URL fetch [%s] error [%s]", iconURL, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, "", "", errors.Errorf("Icon URL fetch [%s] with code [%d]", iconURL, resp.StatusCode)
-	}
-	iconBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", "", err
-	}
-
-	// some iconURLs may not have an extension or the wrong extension, so try to auto-discover
-	// but some sites such as raw.github.com may not provide the mediaType, so we will attempt
-	// to use mediaType for extension, but if value is text/plain use file extension of URL
-	contentType := resp.Header.Get("Content-Type")
-	mediaType, _, _ := mime.ParseMediaType(contentType)
-	if mediaType != "text/plain" && !strings.HasPrefix(mediaType, "image/") {
-		return nil, "", "", errors.Errorf("Icon URL [%s] not image media [%s]", iconURL, mediaType)
-	}
-
-	var extension string
-	if mediaType != "text/plain" {
-		if extensions, _ := mime.ExtensionsByType(contentType); len(extensions) > 0 {
-			extension = extensions[0]
-		}
-	}
-
-	cacheFile, err := h.cacheIcon(iconURL, extension, iconBytes)
-	if err != nil {
-		return nil, "", "", err
-	}
-
-	return iconBytes, cacheFile, iconURL, nil
-}
-
 func (h *Helm) fetchIcon(iconURL, versionDir string) ([]byte, string, string, error) {
-	if strings.HasPrefix(iconURL, "http:") || strings.HasPrefix(iconURL, "https:") {
-		return h.iconFromHTTP(iconURL)
-	}
 	if strings.HasPrefix(iconURL, "file:") {
 		return h.iconFromFile(iconURL, versionDir)
+	}
+	if strings.HasPrefix(iconURL, "http:") || strings.HasPrefix(iconURL, "https:") {
+		return nil, "", iconURL, nil
 	}
 	return nil, "", "", errors.Errorf("unknown file type [%s]", iconURL)
 }
@@ -603,7 +598,7 @@ func (h *Helm) Icon(versions ChartVersions) (string, string, error) {
 
 		_, filename, url, err := h.fetchIcon(version.Icon, version.Dir)
 		if err != nil {
-			logrus.Debugf("Helm icon error: %s", err)
+			logrus.Infof("Helm icon error: %s", err)
 			failed[version.Icon] = true
 			continue
 		}

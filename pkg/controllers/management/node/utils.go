@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -14,9 +15,12 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/rancher/norman/types/convert"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	v32 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/jailer"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 var regExHyphen = regexp.MustCompile("([a-z])([A-Z])")
@@ -30,7 +34,7 @@ var (
 const (
 	errorCreatingNode = "Error creating machine: "
 	nodeDirEnvKey     = "MACHINE_STORAGE_PATH="
-	nodeCmd           = "docker-machine"
+	nodeCmd           = "rancher-machine"
 	ec2TagFlag        = "tags"
 )
 
@@ -79,7 +83,7 @@ func buildCreateCommand(node *v3.Node, configMap map[string]interface{}) []strin
 			}
 		}
 	}
-	logrus.Debugf("create cmd %v", cmd)
+	logrus.Tracef("create cmd %v", cmd)
 	cmd = append(cmd, node.Spec.RequestedHostname)
 	return cmd
 }
@@ -103,11 +107,29 @@ func mapToSlice(m map[string]string) []string {
 	return ret
 }
 
-func buildCommand(nodeDir string, cmdArgs []string) *exec.Cmd {
+func buildCommand(nodeDir string, node *v3.Node, cmdArgs []string) (*exec.Cmd, error) {
+	// only in trace because machine has sensitive details and we can't control who debugs what in there easily
+	if logrus.GetLevel() >= logrus.TraceLevel {
+		// prepend --debug to pass directly to machine
+		cmdArgs = append([]string{"--debug"}, cmdArgs...)
+	}
+
+	// In dev_mode, don't need jail or reference to jail in command
+	if os.Getenv("CATTLE_DEV_MODE") != "" {
+		env := initEnviron(nodeDir)
+		command := exec.Command(nodeCmd, cmdArgs...)
+		command.Env = env
+		logrus.Tracef("buildCommand args: %v", command.Args)
+		return command, nil
+	}
+
 	command := exec.Command(nodeCmd, cmdArgs...)
-	env := initEnviron(nodeDir)
-	command.Env = env
-	return command
+	command.Env = []string{
+		nodeDirEnvKey + nodeDir,
+		"PATH=/usr/bin:/var/lib/rancher/management-state/bin",
+	}
+	logrus.Tracef("buildCommand args: %v", command.Args)
+	return jailer.JailCommand(command, path.Join(jailer.BaseJailPath, node.Namespace))
 }
 
 func initEnviron(nodeDir string) []string {
@@ -151,28 +173,39 @@ func startReturnOutput(command *exec.Cmd) (io.ReadCloser, io.ReadCloser, error) 
 	return readerStdout, readerStderr, nil
 }
 
-func getSSHKey(nodeDir string, obj *v3.Node) (string, error) {
-	if err := waitUntilSSHKey(nodeDir, obj); err != nil {
+func getSSHKey(nodeDir, keyPath string, obj *v3.Node) (string, error) {
+	keyName := filepath.Base(keyPath)
+	if keyName == "" || keyName == "." || keyName == string(filepath.Separator) {
+		keyName = "id_rsa"
+	}
+	if err := waitUntilSSHKey(nodeDir, keyName, obj); err != nil {
 		return "", err
 	}
 
-	return getSSHPrivateKey(nodeDir, obj)
+	return getSSHPrivateKey(nodeDir, keyName, obj)
 }
 
 func (m *Lifecycle) reportStatus(stdoutReader io.Reader, stderrReader io.Reader, node *v3.Node) (*v3.Node, error) {
 	scanner := bufio.NewScanner(stdoutReader)
+	debugPrefix := fmt.Sprintf("(%s) DBG | ", node.Spec.RequestedHostname)
 	for scanner.Scan() {
 		msg := scanner.Text()
 		if strings.Contains(msg, "To see how to connect") {
 			continue
 		}
-		logrus.Infof("stdout: %s", msg)
 		_, err := filterDockerMessage(msg, node)
 		if err != nil {
 			return node, err
 		}
-		logrus.Info(msg)
-		v3.NodeConditionProvisioned.Message(node, msg)
+		if strings.HasPrefix(msg, debugPrefix) {
+			// calls in machine with log.Debug are all prefixed and spammy so only log
+			// under trace and don't add to the v3.NodeConditionProvisioned.Message
+			logrus.Tracef("[node-controller-rancher-machine] %v", msg)
+		} else {
+			logrus.Infof("[node-controller-rancher-machine] %v", msg)
+			v32.NodeConditionProvisioned.Message(node, msg)
+		}
+
 		// ignore update errors
 		if newObj, err := m.nodeClient.Update(node); err == nil {
 			node = newObj
@@ -198,8 +231,12 @@ func filterDockerMessage(msg string, node *v3.Node) (string, error) {
 	return msg, nil
 }
 
-func nodeExists(nodeDir string, name string) (bool, error) {
-	command := buildCommand(nodeDir, []string{"ls", "-q"})
+func nodeExists(nodeDir string, node *v3.Node) (bool, error) {
+	command, err := buildCommand(nodeDir, node, []string{"ls", "-q"})
+	if err != nil {
+		return false, err
+	}
+
 	r, err := command.StdoutPipe()
 	if err != nil {
 		return false, err
@@ -213,7 +250,7 @@ func nodeExists(nodeDir string, name string) (bool, error) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		foundName := scanner.Text()
-		if foundName == name {
+		if foundName == node.Spec.RequestedHostname {
 			return true, nil
 		}
 	}
@@ -229,16 +266,32 @@ func nodeExists(nodeDir string, name string) (bool, error) {
 }
 
 func deleteNode(nodeDir string, node *v3.Node) error {
-	command := buildCommand(nodeDir, []string{"rm", "-f", node.Spec.RequestedHostname})
-	if err := command.Start(); err != nil {
+	command, err := buildCommand(nodeDir, node, []string{"rm", "-f", node.Spec.RequestedHostname})
+	if err != nil {
 		return err
+	}
+	stdoutReader, stderrReader, err := startReturnOutput(command)
+	if err != nil {
+		return err
+	}
+	defer stdoutReader.Close()
+	defer stderrReader.Close()
+	scanner := bufio.NewScanner(stdoutReader)
+	for scanner.Scan() {
+		msg := scanner.Text()
+		logrus.Infof("[node-controller-rancher-machine] %v", msg)
+	}
+	scanner = bufio.NewScanner(stderrReader)
+	for scanner.Scan() {
+		msg := scanner.Text()
+		logrus.Warnf("[node-controller-rancher-machine] %v", msg)
 	}
 
 	return command.Wait()
 }
 
-func getSSHPrivateKey(nodeDir string, node *v3.Node) (string, error) {
-	keyPath := filepath.Join(nodeDir, "machines", node.Spec.RequestedHostname, "id_rsa")
+func getSSHPrivateKey(nodeDir, keyName string, node *v3.Node) (string, error) {
+	keyPath := filepath.Join(nodeDir, "machines", node.Spec.RequestedHostname, keyName)
 	data, err := ioutil.ReadFile(keyPath)
 	if err != nil {
 		return "", nil
@@ -246,8 +299,8 @@ func getSSHPrivateKey(nodeDir string, node *v3.Node) (string, error) {
 	return string(data), nil
 }
 
-func waitUntilSSHKey(nodeDir string, node *v3.Node) error {
-	keyPath := filepath.Join(nodeDir, "machines", node.Spec.RequestedHostname, "id_rsa")
+func waitUntilSSHKey(nodeDir, keyName string, node *v3.Node) error {
+	keyPath := filepath.Join(nodeDir, "machines", node.Spec.RequestedHostname, keyName)
 	startTime := time.Now()
 	increments := 1
 	for {
@@ -273,4 +326,18 @@ func setEc2ClusterIDTag(data interface{}, clusterID string) {
 			m[ec2TagFlag] = convert.ToString(tags) + "," + tagValue
 		}
 	}
+}
+
+func (m *Lifecycle) getKubeConfig(cluster *v3.Cluster) (*clientcmdapi.Config, error) {
+	user, err := m.systemAccountManager.GetSystemUser(cluster.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	token, err := m.userManager.EnsureToken("node-removal-drain-"+user.Name, "token for node drain during removal", "agent", user.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	return m.clusterManager.KubeConfig(cluster.Name, token), nil
 }

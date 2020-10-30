@@ -2,9 +2,10 @@ package httpproxy
 
 import (
 	"fmt"
-	"github.com/rancher/rancher/pkg/namespace"
-	"github.com/rancher/types/apis/core/v1"
 	"strings"
+
+	v1 "github.com/rancher/rancher/pkg/generated/norman/core/v1"
+	"github.com/rancher/rancher/pkg/namespace"
 )
 
 func getAuthData(auth string, secrets v1.SecretInterface, fields []string) (map[string]string, map[string]string, error) {

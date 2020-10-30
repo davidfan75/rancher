@@ -4,17 +4,17 @@ import (
 	"fmt"
 	"strings"
 
+	v32 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+
 	"github.com/mitchellh/mapstructure"
 	"github.com/rancher/norman/api/handler"
 	"github.com/rancher/norman/httperror"
 	"github.com/rancher/norman/types"
 	"github.com/rancher/norman/types/convert"
-	"github.com/rancher/rancher/pkg/api/store/auth"
 	"github.com/rancher/rancher/pkg/auth/providers/common"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	managementschema "github.com/rancher/types/apis/management.cattle.io/v3/schema"
-	"github.com/rancher/types/apis/management.cattle.io/v3public"
-	"github.com/rancher/types/client/management/v3"
+	client "github.com/rancher/rancher/pkg/client/generated/management/v3"
+	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
+	managementschema "github.com/rancher/rancher/pkg/schemas/management.cattle.io/v3"
 	"github.com/sirupsen/logrus"
 )
 
@@ -45,7 +45,7 @@ func (p *adProvider) testAndApply(actionName string, action *types.Action, reque
 	if err != nil {
 		return err
 	}
-	configApplyInput := &v3.ActiveDirectoryTestAndApplyInput{}
+	configApplyInput := &v32.ActiveDirectoryTestAndApplyInput{}
 	if err := mapstructure.Decode(input, configApplyInput); err != nil {
 		return httperror.NewAPIError(httperror.InvalidBodyContent,
 			fmt.Sprintf("Failed to parse body: %v", err))
@@ -53,14 +53,14 @@ func (p *adProvider) testAndApply(actionName string, action *types.Action, reque
 
 	config := &configApplyInput.ActiveDirectoryConfig
 
-	login := &v3public.BasicLogin{
+	login := &v32.BasicLogin{
 		Username: configApplyInput.Username,
 		Password: configApplyInput.Password,
 	}
 
 	if config.ServiceAccountPassword != "" {
 		value, err := common.ReadFromSecret(p.secrets, config.ServiceAccountPassword,
-			strings.ToLower(auth.TypeToField[client.ActiveDirectoryConfigType]))
+			strings.ToLower(client.ActiveDirectoryConfigFieldServiceAccountPassword))
 		if err != nil {
 			return err
 		}
@@ -99,7 +99,7 @@ func (p *adProvider) testAndApply(actionName string, action *types.Action, reque
 	return p.tokenMGR.CreateTokenAndSetCookie(user.Name, userPrincipal, groupPrincipals, "", 0, "Token via AD Configuration", request)
 }
 
-func (p *adProvider) saveActiveDirectoryConfig(config *v3.ActiveDirectoryConfig) error {
+func (p *adProvider) saveActiveDirectoryConfig(config *v32.ActiveDirectoryConfig) error {
 	storedConfig, _, err := p.getActiveDirectoryConfig()
 	if err != nil {
 		return err
@@ -109,7 +109,7 @@ func (p *adProvider) saveActiveDirectoryConfig(config *v3.ActiveDirectoryConfig)
 	config.Type = client.ActiveDirectoryConfigType
 	config.ObjectMeta = storedConfig.ObjectMeta
 
-	field := strings.ToLower(auth.TypeToField[config.Type])
+	field := strings.ToLower(client.ActiveDirectoryConfigFieldServiceAccountPassword)
 	if err := common.CreateOrUpdateSecrets(p.secrets, config.ServiceAccountPassword, field, strings.ToLower(convert.ToString(config.Type))); err != nil {
 		return err
 	}

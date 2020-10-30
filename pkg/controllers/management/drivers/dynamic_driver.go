@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -39,7 +38,7 @@ func (d *DynamicDriver) Install() error {
 		return nil
 	}
 
-	binaryPath := path.Join(binDir(), d.DriverName)
+	binaryPath := d.binName()
 	tmpPath := binaryPath + "-tmp"
 	f, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
 	if err != nil {
@@ -66,7 +65,8 @@ func (d *DynamicDriver) Install() error {
 	return nil
 }
 
-func (d *BaseDriver) Excutable() error {
+// Executable is will return nil if the driver can be executed
+func (d *BaseDriver) Executable() error {
 	if d.DriverName == "" {
 		return fmt.Errorf("Empty driver name")
 	}
@@ -75,7 +75,7 @@ func (d *BaseDriver) Excutable() error {
 		return nil
 	}
 
-	binaryPath := path.Join(binDir(), d.DriverName)
+	binaryPath := d.binName()
 	_, err := os.Stat(binaryPath)
 	if err != nil {
 		return fmt.Errorf("Driver %s not found", binaryPath)
@@ -85,12 +85,4 @@ func (d *BaseDriver) Excutable() error {
 		return errors.Wrapf(err, "Driver binary %s couldn't execute", binaryPath)
 	}
 	return nil
-}
-
-func (d *DynamicDriver) binDir() string {
-	dest := os.Getenv("GMS_BIN_DIR")
-	if dest != "" {
-		return dest
-	}
-	return "./management-state/bin"
 }

@@ -2,20 +2,22 @@ package nodedriver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"github.com/rancher/norman/types/convert"
-	"github.com/rancher/rancher/pkg/controllers/management/drivers"
+	"os/exec"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 
-	"github.com/rancher/norman/types"
-
 	errs "github.com/pkg/errors"
-	"github.com/rancher/types/apis/core/v1"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	"github.com/rancher/types/config"
+	"github.com/rancher/norman/types"
+	"github.com/rancher/norman/types/convert"
+	v32 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/controllers/management/drivers"
+	v1 "github.com/rancher/rancher/pkg/generated/norman/core/v1"
+	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/types/config"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -25,10 +27,29 @@ import (
 var (
 	SchemaLock = sync.Mutex{}
 	driverLock = sync.Mutex{}
+	// Aliases maps Driver field => schema field
+	// The opposite of this lives in pkg/controllers/management/node/controller.go
+	Aliases = map[string]map[string]string{
+		"aliyunecs":     map[string]string{"sshKeypath": "sshKeyContents"},
+		"amazonec2":     map[string]string{"sshKeypath": "sshKeyContents", "userdata": "userdata"},
+		"azure":         map[string]string{"customData": "customData"},
+		"digitalocean":  map[string]string{"sshKeyPath": "sshKeyContents", "userdata": "userdata"},
+		"exoscale":      map[string]string{"sshKey": "sshKey", "userdata": "userdata"},
+		"openstack":     map[string]string{"cacert": "cacert", "privateKeyFile": "privateKeyFile", "userDataFile": "userDataFile"},
+		"otc":           map[string]string{"privateKeyFile": "privateKeyFile"},
+		"packet":        map[string]string{"userdata": "userdata"},
+		"vmwarevsphere": map[string]string{"cloud-config": "cloudConfig"},
+	}
+	SSHKeyFields = map[string]bool{
+		"sshKeyContents": true,
+		"sshKey":         true,
+		"privateKeyFile": true,
+	}
 )
 
 const (
-	driverNameLabel = "io.cattle.node_driver.name"
+	driverNameLabel  = "io.cattle.node_driver.name"
+	uiFieldHintsAnno = "io.cattle.nodedriver/ui-field-hints"
 )
 
 func Register(ctx context.Context, management *config.ManagementContext) {
@@ -42,17 +63,23 @@ func Register(ctx context.Context, management *config.ManagementContext) {
 		schemas:          management.Schemas,
 	}
 
-	nodeDriverClient.
-		AddLifecycle(ctx, "node-driver-controller", nodeDriverLifecycle)
+	version, err := getRancherMachineVersion()
+	if err != nil {
+		logrus.Warnf("error getting rancher-machine version: %v", err)
+	}
+	nodeDriverLifecycle.dockerMachineVersion = version
+
+	nodeDriverClient.AddLifecycle(ctx, "node-driver-controller", nodeDriverLifecycle)
 }
 
 type Lifecycle struct {
-	nodeDriverClient v3.NodeDriverInterface
-	schemaClient     v3.DynamicSchemaInterface
-	schemaLister     v3.DynamicSchemaLister
-	secretStore      v1.SecretInterface
-	nsStore          v1.NamespaceInterface
-	schemas          *types.Schemas
+	nodeDriverClient     v3.NodeDriverInterface
+	schemaClient         v3.DynamicSchemaInterface
+	schemaLister         v3.DynamicSchemaLister
+	secretStore          v1.SecretInterface
+	nsStore              v1.NamespaceInterface
+	schemas              *types.Schemas
+	dockerMachineVersion string
 }
 
 func (m *Lifecycle) Create(obj *v3.NodeDriver) (runtime.Object, error) {
@@ -66,6 +93,8 @@ func (m *Lifecycle) download(obj *v3.NodeDriver) (*v3.NodeDriver, error) {
 		return obj, nil
 	}
 
+	forceUpdate := m.checkDriverVersion(obj)
+
 	err := errs.New("not found")
 	// if node driver was created, we also activate the driver by default
 	driver := drivers.NewDynamicDriver(obj.Spec.Builtin, obj.Spec.DisplayName, obj.Spec.URL, obj.Spec.Checksum)
@@ -75,18 +104,22 @@ func (m *Lifecycle) download(obj *v3.NodeDriver) (*v3.NodeDriver, error) {
 		existingSchema, err = m.schemaLister.Get("", schemaName)
 	}
 
-	if driver.Exists() && err == nil {
+	if driver.Exists() && err == nil && !forceUpdate {
 		// add credential schema
-		credFields := map[string]v3.Field{}
+		credFields := map[string]v32.Field{}
 		if err != nil {
 			logrus.Errorf("error getting schema %v", err)
 		}
-		userCredFields, pwdFields, defaults := getCredFields(obj.Annotations)
+		pubCredFields, privateCredFields, passwordFields, defaults := getCredFields(obj.Annotations)
 		for name, field := range existingSchema.Spec.ResourceFields {
-			if pwdFields[name] {
-				field.Type = "password"
+			if SSHKeyFields[name] || passwordFields[name] || privateCredFields[name] {
+				if field.Type != "password" {
+					forceUpdate = true
+					break
+				}
 			}
-			if field.Type == "password" || userCredFields[name] {
+			// even if forceUpdate is false, calculate credFields to check if credSchema needs to be updated
+			if privateCredFields[name] || pubCredFields[name] {
 				credField := field
 				credField.Required = true
 				if val, ok := defaults[name]; ok {
@@ -95,22 +128,24 @@ func (m *Lifecycle) download(obj *v3.NodeDriver) (*v3.NodeDriver, error) {
 				credFields[name] = credField
 			}
 		}
-		return m.createCredSchema(obj, credFields)
+		if !forceUpdate {
+			return m.createCredSchema(obj, credFields)
+		}
 	}
 
-	if !driver.Exists() {
-		v3.NodeDriverConditionDownloaded.Unknown(obj)
-		v3.NodeDriverConditionInstalled.Unknown(obj)
+	if !driver.Exists() || forceUpdate {
+		v32.NodeDriverConditionDownloaded.Unknown(obj)
+		v32.NodeDriverConditionInstalled.Unknown(obj)
 	}
 
-	newObj, err := v3.NodeDriverConditionDownloaded.Once(obj, func() (runtime.Object, error) {
+	newObj, err := v32.NodeDriverConditionDownloaded.Once(obj, func() (runtime.Object, error) {
 		// update status
 		obj, err = m.nodeDriverClient.Update(obj)
 		if err != nil {
 			return nil, err
 		}
 
-		if err := driver.Stage(); err != nil {
+		if err := driver.Stage(forceUpdate); err != nil {
 			return nil, err
 		}
 		return obj, nil
@@ -120,11 +155,11 @@ func (m *Lifecycle) download(obj *v3.NodeDriver) (*v3.NodeDriver, error) {
 	}
 
 	obj = newObj.(*v3.NodeDriver)
-	newObj, err = v3.NodeDriverConditionInstalled.Once(obj, func() (runtime.Object, error) {
+	newObj, err = v32.NodeDriverConditionInstalled.Once(obj, func() (runtime.Object, error) {
 		if err := driver.Install(); err != nil {
 			return nil, err
 		}
-		if err = driver.Excutable(); err != nil {
+		if err = driver.Executable(); err != nil {
 			return nil, err
 		}
 		obj.Spec.DisplayName = strings.TrimPrefix(driver.Name(), drivers.DockerMachineDriverPrefix)
@@ -136,22 +171,39 @@ func (m *Lifecycle) download(obj *v3.NodeDriver) (*v3.NodeDriver, error) {
 
 	obj = newObj.(*v3.NodeDriver)
 	driverName := strings.TrimPrefix(driver.Name(), drivers.DockerMachineDriverPrefix)
+
+	obj = m.addVersionInfo(obj)
+
+	obj, err = m.addUIHintsAnno(driverName, obj)
+	if err != nil {
+		return obj, errs.Wrap(err, "failed JSON in addUIHintsAnno")
+	}
+
 	flags, err := getCreateFlagsForDriver(driverName)
 	if err != nil {
 		return nil, err
 	}
-	credFields := map[string]v3.Field{}
-	resourceFields := map[string]v3.Field{}
-	userCredFields, pwdFields, defaults := getCredFields(obj.Annotations)
+	credFields := map[string]v32.Field{}
+	resourceFields := map[string]v32.Field{}
+	pubCredFields, privateCredFields, passwordFields, defaults := getCredFields(obj.Annotations)
 	for _, flag := range flags {
 		name, field, err := FlagToField(flag)
 		if err != nil {
 			return nil, err
 		}
-		if pwdFields[name] {
+		if aliases, ok := Aliases[driverName]; ok {
+			// convert path fields to their alias to take file contents
+			if alias, ok := aliases[name]; ok {
+				name = alias
+				field.Description = fmt.Sprintf("File contents for %v", alias)
+			}
+		}
+
+		if privateCredFields[name] || passwordFields[name] || SSHKeyFields[name] {
 			field.Type = "password"
 		}
-		if field.Type == "password" || userCredFields[name] {
+
+		if pubCredFields[name] || privateCredFields[name] {
 			credField := field
 			credField.Required = true
 			if val, ok := defaults[name]; ok {
@@ -159,11 +211,11 @@ func (m *Lifecycle) download(obj *v3.NodeDriver) (*v3.NodeDriver, error) {
 			}
 			credFields[name] = credField
 		}
+
 		resourceFields[name] = field
 	}
-
 	dynamicSchema := &v3.DynamicSchema{
-		Spec: v3.DynamicSchemaSpec{
+		Spec: v32.DynamicSchemaSpec{
 			ResourceFields: resourceFields,
 		},
 	}
@@ -178,20 +230,34 @@ func (m *Lifecycle) download(obj *v3.NodeDriver) (*v3.NodeDriver, error) {
 	}
 	dynamicSchema.Labels = map[string]string{}
 	dynamicSchema.Labels[driverNameLabel] = obj.Spec.DisplayName
+
 	_, err = m.schemaClient.Create(dynamicSchema)
-	if err != nil && !errors.IsAlreadyExists(err) {
-		return obj, err
+	if err != nil {
+		if !errors.IsAlreadyExists(err) {
+			return obj, err
+		}
+		ds, err := m.schemaClient.Get(dynamicSchema.Name, metav1.GetOptions{})
+		if err != nil {
+			return obj, err
+		}
+		ds.Spec.ResourceFields = resourceFields
+
+		_, err = m.schemaClient.Update(ds)
+		if err != nil {
+			return obj, err
+		}
 	}
+
 	return m.createCredSchema(obj, credFields)
 }
 
-func (m *Lifecycle) createCredSchema(obj *v3.NodeDriver, credFields map[string]v3.Field) (*v3.NodeDriver, error) {
+func (m *Lifecycle) createCredSchema(obj *v3.NodeDriver, credFields map[string]v32.Field) (*v3.NodeDriver, error) {
 	name := credentialConfigSchemaName(obj.Spec.DisplayName)
 	credSchema, err := m.schemaLister.Get("", name)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			credentialSchema := &v3.DynamicSchema{
-				Spec: v3.DynamicSchemaSpec{
+				Spec: v32.DynamicSchemaSpec{
 					ResourceFields: credFields,
 				},
 			}
@@ -219,6 +285,68 @@ func (m *Lifecycle) createCredSchema(obj *v3.NodeDriver, credFields map[string]v
 	return obj, nil
 }
 
+func (m *Lifecycle) checkDriverVersion(obj *v3.NodeDriver) bool {
+	if v32.NodeDriverConditionDownloaded.IsUnknown(obj) || v32.NodeDriverConditionInstalled.IsUnknown(obj) {
+		return true
+	}
+
+	driverName := strings.TrimPrefix(obj.Spec.DisplayName, drivers.DockerMachineDriverPrefix)
+
+	if _, ok := Aliases[driverName]; ok {
+		if val, ok := obj.Annotations[uiFieldHintsAnno]; !ok || val == "" {
+			return true
+		}
+	}
+
+	// Builtin drivers use the rancher-machine version to validate against
+	if obj.Spec.Builtin {
+		if obj.Status.AppliedDockerMachineVersion != m.dockerMachineVersion {
+			return true
+		}
+		return false
+	}
+
+	if obj.Spec.URL != obj.Status.AppliedURL || obj.Spec.Checksum != obj.Status.AppliedChecksum {
+		return true
+	}
+
+	return false
+}
+
+func (m *Lifecycle) addVersionInfo(obj *v3.NodeDriver) *v3.NodeDriver {
+	if obj.Spec.Builtin {
+		obj.Status.AppliedDockerMachineVersion = m.dockerMachineVersion
+	} else {
+		obj.Status.AppliedURL = obj.Spec.URL
+		obj.Status.AppliedChecksum = obj.Spec.Checksum
+	}
+	return obj
+}
+
+func (m *Lifecycle) addUIHintsAnno(driverName string, obj *v3.NodeDriver) (*v3.NodeDriver, error) {
+	if aliases, ok := Aliases[driverName]; ok {
+		anno := make(map[string]map[string]string)
+
+		for _, aliased := range aliases {
+			anno[aliased] = map[string]string{
+				"type": "multiline",
+			}
+		}
+
+		jsonAnno, err := json.Marshal(anno)
+		if err != nil {
+			return obj, err
+		}
+
+		if obj.Annotations == nil {
+			obj.Annotations = make(map[string]string)
+		}
+
+		obj.Annotations[uiFieldHintsAnno] = string(jsonAnno)
+	}
+	return obj, nil
+}
+
 func (m *Lifecycle) Updated(obj *v3.NodeDriver) (runtime.Object, error) {
 	var err error
 
@@ -236,8 +364,8 @@ func (m *Lifecycle) Updated(obj *v3.NodeDriver) (runtime.Object, error) {
 		return obj, err
 	}
 
-	v3.NodeDriverConditionActive.True(obj)
-	v3.NodeDriverConditionInactive.True(obj)
+	v32.NodeDriverConditionActive.True(obj)
+	v32.NodeDriverConditionInactive.True(obj)
 
 	return obj, nil
 }
@@ -285,9 +413,9 @@ func (m *Lifecycle) createOrUpdateNodeForEmbeddedTypeWithParents(embeddedType, f
 	if err != nil && !errors.IsNotFound(err) {
 		return err
 	} else if errors.IsNotFound(err) {
-		resourceField := map[string]v3.Field{}
+		resourceField := map[string]v32.Field{}
 		if embedded {
-			resourceField[fieldName] = v3.Field{
+			resourceField[fieldName] = v32.Field{
 				Create:   true,
 				Nullable: true,
 				Update:   update,
@@ -309,12 +437,12 @@ func (m *Lifecycle) createOrUpdateNodeForEmbeddedTypeWithParents(embeddedType, f
 	shouldUpdate := false
 	if embedded {
 		if nodeSchema.Spec.ResourceFields == nil {
-			nodeSchema.Spec.ResourceFields = map[string]v3.Field{}
+			nodeSchema.Spec.ResourceFields = map[string]v32.Field{}
 		}
 		if _, ok := nodeSchema.Spec.ResourceFields[fieldName]; !ok {
 			// if embedded we add the type to schema
 			logrus.Infof("uploading %s to %s schema", fieldName, schemaID)
-			nodeSchema.Spec.ResourceFields[fieldName] = v3.Field{
+			nodeSchema.Spec.ResourceFields[fieldName] = v32.Field{
 				Create:   true,
 				Nullable: true,
 				Update:   update,
@@ -341,7 +469,7 @@ func (m *Lifecycle) createOrUpdateNodeForEmbeddedTypeWithParents(embeddedType, f
 	return nil
 }
 
-func getCredFields(annotations map[string]string) (map[string]bool, map[string]bool, map[string]string) {
+func getCredFields(annotations map[string]string) (map[string]bool, map[string]bool, map[string]bool, map[string]string) {
 	getMap := func(fields string) map[string]bool {
 		data := map[string]bool{}
 		for _, field := range strings.Split(fields, ",") {
@@ -359,30 +487,39 @@ func getCredFields(annotations map[string]string) (map[string]bool, map[string]b
 		}
 		return data
 	}
-	return getMap(annotations["cred"]), getMap(annotations["password"]), getDefaults(annotations["defaults"])
+	return getMap(annotations["publicCredentialFields"]),
+		getMap(annotations["privateCredentialFields"]),
+		getMap(annotations["passwordFields"]),
+		getDefaults(annotations["defaults"])
 }
 
 func credentialConfigSchemaName(driverName string) string {
 	return fmt.Sprintf("%s%s", driverName, "credentialconfig")
 }
 
-func updateDefault(credField v3.Field, val, kind string) v3.Field {
+func updateDefault(credField v32.Field, val, kind string) v32.Field {
 	switch kind {
 	case "int":
 		i, err := strconv.Atoi(val)
 		if err == nil {
-			credField.Default = v3.Values{IntValue: i}
+			credField.Default = v32.Values{IntValue: i}
 		} else {
 			logrus.Errorf("error converting %s to int %v", val, err)
 		}
 	case "boolean":
-		credField.Default = v3.Values{BoolValue: convert.ToBool(val)}
+		credField.Default = v32.Values{BoolValue: convert.ToBool(val)}
 	case "array[string]":
-		credField.Default = v3.Values{StringSliceValue: convert.ToStringSlice(val)}
+		credField.Default = v32.Values{StringSliceValue: convert.ToStringSlice(val)}
 	case "password", "string":
-		credField.Default = v3.Values{StringValue: val}
+		credField.Default = v32.Values{StringValue: val}
 	default:
 		logrus.Errorf("unsupported kind for default val:%s kind:%s", val, kind)
 	}
 	return credField
+}
+
+func getRancherMachineVersion() (string, error) {
+	cmd := exec.Command("rancher-machine", "--version")
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }

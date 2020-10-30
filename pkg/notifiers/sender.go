@@ -2,24 +2,34 @@ package notifiers
 
 import (
 	"bytes"
+	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"mime/multipart"
 	"net"
 	"net/http"
 	"net/smtp"
 	"net/textproto"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	v32 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+
+	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
+	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/types/config/dialer"
 )
+
+const contentTypeJSON = "application/json"
 
 type Message struct {
 	Title   string
@@ -35,12 +45,17 @@ type wechatResponse struct {
 	Error string `json:"error"`
 }
 
-func SendMessage(notifier *v3.Notifier, recipient string, msg *Message) error {
+type dingtalkResponse struct {
+	Errcode int    `json:"errcode"`
+	Errmsg  string `json:"errmsg"`
+}
+
+func SendMessage(ctx context.Context, notifier *v3.Notifier, recipient string, msg *Message, dialer dialer.Dialer) error {
 	if notifier.Spec.SlackConfig != nil {
 		if recipient == "" {
 			recipient = notifier.Spec.SlackConfig.DefaultRecipient
 		}
-		return TestSlack(notifier.Spec.SlackConfig.URL, recipient, msg.Content)
+		return TestSlack(notifier.Spec.SlackConfig.URL, recipient, msg.Content, notifier.Spec.SlackConfig.HTTPClientConfig, dialer)
 	}
 
 	if notifier.Spec.SMTPConfig != nil {
@@ -48,11 +63,11 @@ func SendMessage(notifier *v3.Notifier, recipient string, msg *Message) error {
 		if recipient == "" {
 			recipient = s.DefaultRecipient
 		}
-		return TestEmail(s.Host, s.Password, s.Username, int(s.Port), s.TLS, msg.Title, msg.Content, recipient, s.Sender)
+		return TestEmail(ctx, s.Host, s.Password, s.Username, int(s.Port), s.TLS, msg.Title, msg.Content, recipient, s.Sender, dialer)
 	}
 
 	if notifier.Spec.PagerdutyConfig != nil {
-		return TestPagerduty(notifier.Spec.PagerdutyConfig.ServiceKey, msg.Content)
+		return TestPagerduty(notifier.Spec.PagerdutyConfig.ServiceKey, msg.Content, notifier.Spec.PagerdutyConfig.HTTPClientConfig, dialer)
 	}
 
 	if notifier.Spec.WechatConfig != nil {
@@ -60,17 +75,26 @@ func SendMessage(notifier *v3.Notifier, recipient string, msg *Message) error {
 		if recipient == "" {
 			recipient = s.DefaultRecipient
 		}
-		return TestWechat(notifier.Spec.WechatConfig.Secret, notifier.Spec.WechatConfig.Agent, notifier.Spec.WechatConfig.Corp, notifier.Spec.WechatConfig.RecipientType, recipient, msg.Content)
+		return TestWechat(notifier.Spec.WechatConfig.Secret, notifier.Spec.WechatConfig.Agent, notifier.Spec.WechatConfig.Corp, notifier.Spec.WechatConfig.RecipientType,
+			recipient, msg.Content, notifier.Spec.WechatConfig.HTTPClientConfig, dialer)
 	}
 
 	if notifier.Spec.WebhookConfig != nil {
-		return TestWebhook(notifier.Spec.WebhookConfig.URL, msg.Content)
+		return TestWebhook(notifier.Spec.WebhookConfig.URL, msg.Content, notifier.Spec.WebhookConfig.HTTPClientConfig, dialer)
+	}
+
+	if notifier.Spec.DingtalkConfig != nil {
+		return TestDingtalk(notifier.Spec.DingtalkConfig.URL, notifier.Spec.DingtalkConfig.Secret, msg.Content, notifier.Spec.DingtalkConfig.HTTPClientConfig, dialer)
+	}
+
+	if notifier.Spec.MSTeamsConfig != nil {
+		return TestMicrosoftTeams(notifier.Spec.MSTeamsConfig.URL, msg.Content, notifier.Spec.MSTeamsConfig.HTTPClientConfig, dialer)
 	}
 
 	return errors.New("Notifier not configured")
 }
 
-func TestPagerduty(key, msg string) error {
+func TestPagerduty(key, msg string, cfg *v32.HTTPClientConfig, dialer dialer.Dialer) error {
 	if msg == "" {
 		msg = "Pagerduty setting validated"
 	}
@@ -92,19 +116,25 @@ func TestPagerduty(key, msg string) error {
 	if err := json.NewEncoder(&buf).Encode(pd); err != nil {
 		return err
 	}
-	resp, err := http.Post(url, "application/json", &buf)
+
+	client, err := NewClientFromConfig(cfg, dialer)
+	if err != nil {
+		return err
+	}
+
+	resp, err := post(client, url, contentTypeJSON, &buf)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("http status code is %d, not include in the 2xx success HTTP status codes", resp.StatusCode)
+		return fmt.Errorf("HTTP status code is %d, not included in the 2xx success HTTP status codes", resp.StatusCode)
 	}
 
 	return nil
 }
 
-func TestWechat(secret, agent, corp, receiverType, receiver, msg string) error {
+func TestWechat(secret, agent, corp, receiverType, receiver, msg string, cfg *v32.HTTPClientConfig, dialer dialer.Dialer) error {
 	if msg == "" {
 		msg = "Wechat setting validated"
 	}
@@ -119,10 +149,10 @@ func TestWechat(secret, agent, corp, receiverType, receiver, msg string) error {
 	q.Add("corpsecret", secret)
 	req.URL.RawQuery = q.Encode()
 
-	client := &http.Client{
-		Timeout: 15 * time.Second,
+	client, err := NewClientFromConfig(cfg, dialer)
+	if err != nil {
+		return err
 	}
-	var wechatToken wechatToken
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -134,6 +164,7 @@ func TestWechat(secret, agent, corp, receiverType, receiver, msg string) error {
 		return err
 	}
 
+	var wechatToken wechatToken
 	if err := json.Unmarshal(requestBytes, &wechatToken); err != nil {
 		return err
 	}
@@ -165,15 +196,15 @@ func TestWechat(secret, agent, corp, receiverType, receiver, msg string) error {
 	if err := json.NewEncoder(&buf).Encode(wc); err != nil {
 		return err
 	}
-	resp, err = http.Post(url, "application/json", &buf)
 
+	resp, err = post(client, url, contentTypeJSON, &buf)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("http status code is %d, not include in the 2xx success HTTP status codes", resp.StatusCode)
+		return fmt.Errorf("HTTP status code is %d, not included in the 2xx success HTTP status codes", resp.StatusCode)
 	}
 
 	requestBytes, err = ioutil.ReadAll(resp.Body)
@@ -193,7 +224,88 @@ func TestWechat(secret, agent, corp, receiverType, receiver, msg string) error {
 	return nil
 }
 
-func TestWebhook(url, msg string) error {
+func TestDingtalk(url, secret, msg string, cfg *v32.HTTPClientConfig, dialer dialer.Dialer) error {
+	if msg == "" {
+		msg = "Dingtalk setting validated"
+	}
+
+	content := `{"msgtype": "text",
+		"text": {"content": "` + msg + `"},
+		"at": {"isAtAll": true}
+	}`
+
+	url = getDingtalkURL(url, secret)
+
+	client, err := NewClientFromConfig(cfg, dialer)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", url, strings.NewReader(content))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", contentTypeJSON)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("HTTP status code is %d, not included in the 2xx success HTTP status codes", resp.StatusCode)
+	}
+
+	respBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	var dtResp dingtalkResponse
+	if err := json.Unmarshal(respBytes, &dtResp); err != nil {
+		return err
+	}
+
+	if dtResp.Errcode != 0 {
+		return fmt.Errorf("Failed to send Dingtalk message. %s", dtResp.Errmsg)
+	}
+
+	return nil
+}
+
+func TestMicrosoftTeams(url, msg string, cfg *v32.HTTPClientConfig, dialer dialer.Dialer) error {
+	if msg == "" {
+		msg = "MicrosoftTeams setting validated"
+	}
+
+	content := `{"text":"` + msg + `"}`
+
+	client, err := NewClientFromConfig(cfg, dialer)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", url, strings.NewReader(content))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", contentTypeJSON)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("HTTP status code is %d, not included in the 2xx success HTTP status codes", resp.StatusCode)
+	}
+
+	return nil
+}
+
+func TestWebhook(url, msg string, cfg *v32.HTTPClientConfig, dialer dialer.Dialer) error {
 	if msg == "" {
 		msg = "Webhook setting validated"
 	}
@@ -210,20 +322,25 @@ func TestWebhook(url, msg string) error {
 		return err
 	}
 
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(alertData))
+	client, err := NewClientFromConfig(cfg, dialer)
+	if err != nil {
+		return err
+	}
+
+	resp, err := post(client, url, contentTypeJSON, bytes.NewBuffer(alertData))
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("http status code is %d, not include in the 2xx success HTTP status codes", resp.StatusCode)
+		return fmt.Errorf("HTTP status code is %d, not included in the 2xx success HTTP status codes", resp.StatusCode)
 	}
 
 	return nil
 }
 
-func TestSlack(url, channel, msg string) error {
+func TestSlack(url, channel, msg string, cfg *v32.HTTPClientConfig, dialer dialer.Dialer) error {
 	if msg == "" {
 		msg = "Slack setting validated"
 	}
@@ -240,33 +357,38 @@ func TestSlack(url, channel, msg string) error {
 		return err
 	}
 
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
+	client, err := NewClientFromConfig(cfg, dialer)
+	if err != nil {
+		return err
+	}
+
+	resp, err := post(client, url, contentTypeJSON, bytes.NewBuffer(data))
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("http status code is not 200")
-	}
 
 	res, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
 
-	if string(res) != "ok" {
-		return fmt.Errorf("http response is not ok")
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("HTTP status code is %d, not included in the 2xx success HTTP status codes, response: %v", resp.StatusCode, string(res))
+	}
+
+	if !strings.Contains(string(res), "ok") {
+		return fmt.Errorf("HTTP response is not ok")
 	}
 
 	return nil
 }
 
-func TestEmail(host, password, username string, port int, requireTLS bool, title, content, receiver, sender string) error {
+func TestEmail(ctx context.Context, host, password, username string, port int, requireTLS *bool, title, content, receiver, sender string, dialer dialer.Dialer) error {
 	if content == "" {
 		content = "Alert Name: Test SMTP setting"
 	}
-	c, err := smtpInit(host, port)
+	c, err := smtpInit(ctx, host, port, dialer)
 	if err != nil {
 		return err
 	}
@@ -278,12 +400,24 @@ func TestEmail(host, password, username string, port int, requireTLS bool, title
 	return smtpSend(c, title, content, receiver, sender)
 }
 
-func smtpInit(host string, port int) (*smtp.Client, error) {
-	var c *smtp.Client
+func smtpInit(ctx context.Context, host string, port int, dialer dialer.Dialer) (*smtp.Client, error) {
 	smartHost := host + ":" + strconv.Itoa(port)
 	timeout := 15 * time.Second
+	var (
+		conn net.Conn
+		err  error
+		c    *smtp.Client
+	)
 	if port == 465 {
-		conn, err := tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", smartHost, &tls.Config{ServerName: host})
+		if dialer != nil {
+			dialer = dialerWithTLSConfig(dialer, host, smartHost)
+			if err != nil {
+				return nil, fmt.Errorf("Failed to build dialer %v", err)
+			}
+			conn, err = dialer(ctx, "tcp", smartHost)
+		} else {
+			conn, err = tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", smartHost, &tls.Config{ServerName: host})
+		}
 		if err != nil {
 			return nil, fmt.Errorf("Failed to connect smtp server: %v", err)
 		}
@@ -292,7 +426,11 @@ func smtpInit(host string, port int) (*smtp.Client, error) {
 			return nil, fmt.Errorf("Failed to connect smtp server: %v", err)
 		}
 	} else {
-		conn, err := net.DialTimeout("tcp", smartHost, timeout)
+		if dialer != nil {
+			conn, err = dialer(ctx, "tcp", smartHost)
+		} else {
+			conn, err = net.DialTimeout("tcp", smartHost, timeout)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("Failed to connect smtp server: %v", err)
 		}
@@ -304,9 +442,29 @@ func smtpInit(host string, port int) (*smtp.Client, error) {
 	return c, nil
 }
 
-func smtpPrepare(c *smtp.Client, host, password, username string, port int, requireTLS bool) error {
+func dialerWithTLSConfig(dialer dialer.Dialer, host, smartHost string) dialer.Dialer {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         host,
+	}
+
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		rawConn, err := dialer(ctx, "tcp", smartHost)
+		if err != nil {
+			return nil, err
+		}
+		tlsConn := tls.Client(rawConn, tlsConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			rawConn.Close()
+			return nil, err
+		}
+		return tlsConn, err
+	}
+}
+
+func smtpPrepare(c *smtp.Client, host, password, username string, port int, requireTLS *bool) error {
 	smartHost := host + ":" + strconv.Itoa(port)
-	if requireTLS {
+	if *requireTLS {
 		if ok, _ := c.Extension("STARTTLS"); !ok {
 			return fmt.Errorf("Require TLS but %q does not advertise the STARTTLS extension", smartHost)
 		}
@@ -424,7 +582,7 @@ func auth(mechs string, username, password string) (smtp.Auth, error) {
 			return &loginAuth{username, password}, nil
 		}
 	}
-	return nil, fmt.Errorf("smtp server does not support login auth")
+	return nil, fmt.Errorf("SMTP server does not support login auth")
 }
 
 type loginAuth struct {
@@ -448,4 +606,59 @@ func (a *loginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
 		}
 	}
 	return nil, nil
+}
+
+// NewClientFromConfig returns a new HTTP client configured for the
+// given HTTPClientConfig.
+func NewClientFromConfig(cfg *v32.HTTPClientConfig, dialer dialer.Dialer) (*http.Client, error) {
+	client := http.Client{
+		Timeout: time.Second * 10,
+	}
+
+	if IsHTTPClientConfigSet(cfg) {
+		proxyURL, err := url.Parse(cfg.ProxyURL)
+		if err != nil {
+			return nil, errors.Wrapf(err, "Failed to parse notifier proxy url %s", cfg.ProxyURL)
+		}
+		client.Transport = &http.Transport{
+			Proxy:       http.ProxyURL(proxyURL),
+			DialContext: dialer,
+		}
+	}
+
+	return &client, nil
+}
+
+func post(client *http.Client, url string, bodyType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", bodyType)
+	return client.Do(req)
+}
+
+func IsHTTPClientConfigSet(cfg *v32.HTTPClientConfig) bool {
+	if cfg != nil && cfg.ProxyURL != "" {
+		return true
+	}
+	return false
+}
+
+func getDingtalkURL(webhook, secret string) string {
+	if secret != "" {
+		timestamp := time.Now().UnixNano() / 1e6
+
+		stringToSign := fmt.Sprintf("%d\n%s", timestamp, secret)
+
+		key := []byte(secret)
+		h := hmac.New(sha256.New, key)
+		h.Write([]byte(stringToSign))
+
+		signData := base64.StdEncoding.EncodeToString(h.Sum(nil))
+		sign := url.QueryEscape(signData)
+		webhook = fmt.Sprintf("%s&timestamp=%d&sign=%s", webhook, timestamp, sign)
+	}
+
+	return webhook
 }

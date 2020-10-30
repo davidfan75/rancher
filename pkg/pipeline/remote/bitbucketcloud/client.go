@@ -12,13 +12,15 @@ import (
 	"strings"
 	"time"
 
+	v32 "github.com/rancher/rancher/pkg/apis/project.cattle.io/v3"
+
 	"github.com/pkg/errors"
 	"github.com/rancher/norman/httperror"
+	v3 "github.com/rancher/rancher/pkg/generated/norman/project.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/pipeline/remote/model"
 	"github.com/rancher/rancher/pkg/pipeline/utils"
 	"github.com/rancher/rancher/pkg/ref"
 	"github.com/rancher/rancher/pkg/settings"
-	"github.com/rancher/types/apis/project.cattle.io/v3"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
 )
@@ -37,7 +39,7 @@ type client struct {
 	RedirectURL  string
 }
 
-func New(config *v3.BitbucketCloudPipelineConfig) (model.Remote, error) {
+func New(config *v32.BitbucketCloudPipelineConfig) (model.Remote, error) {
 	if config == nil {
 		return nil, errors.New("empty gitlab config")
 	}
@@ -257,19 +259,21 @@ func (c *client) GetBranches(repoURL string, accessToken string) ([]string, erro
 		return nil, err
 	}
 
-	url := fmt.Sprintf("%s/repositories/%s/%s/refs/branches", apiEndpoint, owner, repo)
-
-	b, err := getFromBitbucket(url, accessToken)
-	if err != nil {
-		return nil, err
-	}
-	var branches PaginatedBranches
-	if err := json.Unmarshal(b, &branches); err != nil {
-		return nil, err
-	}
-	result := []string{}
-	for _, b := range branches.Values {
-		result = append(result, b.Name)
+	nexturl := fmt.Sprintf("%s/repositories/%s/%s/refs/branches", apiEndpoint, owner, repo)
+	var result []string
+	for nexturl != "" {
+		b, err := getFromBitbucket(nexturl, accessToken)
+		if err != nil {
+			return nil, err
+		}
+		var pageBranches PaginatedBranches
+		if err := json.Unmarshal(b, &pageBranches); err != nil {
+			return nil, err
+		}
+		for _, branch := range pageBranches.Values {
+			result = append(result, branch.Name)
+		}
+		nexturl = pageBranches.Next
 	}
 
 	return result, nil
@@ -400,7 +404,7 @@ func doRequestToBitbucket(method string, url string, accessToken string, header 
 		return nil, err
 	}
 	client := &http.Client{
-		Timeout: 15 * time.Second,
+		Timeout: 30 * time.Second,
 	}
 	q := req.URL.Query()
 	//set to max 100 per page to reduce query time

@@ -2,6 +2,7 @@ package rkenodeconfigclient
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,8 +11,14 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/rancher/rancher/pkg/agent/node"
+
 	"github.com/rancher/rancher/pkg/rkeworker"
 	"github.com/sirupsen/logrus"
+)
+
+const (
+	Params = "X-API-Tunnel-Params"
 )
 
 var (
@@ -43,20 +50,64 @@ func newErrNodeOrClusterNotFound(msg, occursType string) *ErrNodeOrClusterNotFou
 	}
 }
 
-func ConfigClient(ctx context.Context, url string, header http.Header, writeCertOnly bool) error {
+func ConfigClient(ctx context.Context, url string, header http.Header, writeCertOnly bool) (int, error) {
+	// try a few more times because there is a delay after registering a new node
+	nodeOrClusterNotFoundRetryLimit := 3
+	interval := 120
 	for {
 		nc, err := getConfig(client, url, header)
 		if err != nil {
-			logrus.Infof("Error while getting agent config: %v", err)
+			if _, ok := err.(*ErrNodeOrClusterNotFound); ok {
+				if nodeOrClusterNotFoundRetryLimit < 1 {
+					// return the error if the node cannot connect to server or remove from a cluster
+					return interval, err
+				}
+
+				nodeOrClusterNotFoundRetryLimit--
+			}
+
+			logrus.Warnf("Error while getting agent config: %v", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
 		if nc != nil {
-			return rkeworker.ExecutePlan(ctx, nc, writeCertOnly)
+			logrus.Debugf("Get agent config: %#v", nc)
+			if nc.AgentCheckInterval != 0 {
+				interval = nc.AgentCheckInterval
+			}
+
+			err := rkeworker.ExecutePlan(ctx, nc, writeCertOnly)
+			if err != nil {
+				return interval, err
+			}
+
+			/* server sends non-zero nodeVersion when node is upgrading (node.Status.AppliedVersion != cluster.Status.NodeVersion)
+			ExecutePlan doesn't update processes if writeCertOnly, shouldn't consider this an upgrade */
+			if nc.NodeVersion != 0 && !writeCertOnly {
+				// reply back with nodeVersion
+				params := node.Params()
+				params["nodeVersion"] = nc.NodeVersion
+
+				bytes, err := json.Marshal(params)
+				if err != nil {
+					return interval, err
+				}
+
+				headerCopy := http.Header{}
+				for k, v := range header {
+					headerCopy[k] = v
+				}
+				headerCopy[Params] = []string{base64.StdEncoding.EncodeToString(bytes)}
+				header = headerCopy
+
+				continue
+			}
+
+			return interval, err
 		}
 
-		logrus.Infof("waiting for node to register. Either cluster is not ready for registering or etcd and controlplane node have to be registered first")
+		logrus.Infof("Waiting for node to register. Either cluster is not ready for registering or etcd and controlplane node have to be registered first")
 		time.Sleep(2 * time.Second)
 	}
 }

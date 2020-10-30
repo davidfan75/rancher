@@ -3,13 +3,16 @@ package providerrefresh
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
+	v32 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+
 	"github.com/rancher/rancher/pkg/auth/providers"
+	"github.com/rancher/rancher/pkg/auth/settings"
 	"github.com/rancher/rancher/pkg/auth/tokens"
-	"github.com/rancher/rancher/pkg/settings"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	"github.com/rancher/types/config"
+	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/types/config"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,11 +37,11 @@ func NewUserAuthRefresher(ctx context.Context, scaledContext *config.ScaledConte
 		tokenMGR:            tokens.NewManager(ctx, scaledContext),
 		userAttributes:      scaledContext.Management.UserAttributes(""),
 		userAttributeLister: scaledContext.Management.UserAttributes("").Controller().Lister(),
-		settingLister:       scaledContext.Management.Settings("").Controller().Lister(),
 	}
 }
 
 type refresher struct {
+	sync.Mutex
 	tokenLister         v3.TokenLister
 	tokens              v3.TokenInterface
 	tokenMGR            *tokens.Manager
@@ -48,11 +51,10 @@ type refresher struct {
 	intervalInSeconds   int64
 	unparsedMaxAge      string
 	maxAge              time.Duration
-	settingLister       v3.SettingLister
 }
 
 func (r *refresher) ensureMaxAgeUpToDate(maxAge string) {
-	if r.unparsedMaxAge == maxAge {
+	if r.unparsedMaxAge == maxAge || maxAge == "" {
 		return
 	}
 
@@ -71,8 +73,9 @@ func (r *refresher) TriggerUserRefresh(userName string, force bool) {
 	} else {
 		logrus.Debugf("Triggering auth refresh on %v", userName)
 	}
-
+	r.Lock()
 	r.ensureMaxAgeUpToDate(settings.AuthUserInfoMaxAgeSeconds.Get())
+	r.Unlock()
 	if !force && (r.maxAge <= 0) {
 		logrus.Debugf("Skipping refresh trigger on user %v because max age setting is <= 0", userName)
 		return
@@ -242,7 +245,7 @@ func (r *refresher) refreshAttributes(attribs *v3.UserAttribute) (*v3.UserAttrib
 			newGroupPrincipals = nil
 		}
 
-		attribs.GroupPrincipals[providerName] = v3.Principals{Items: newGroupPrincipals}
+		attribs.GroupPrincipals[providerName] = v32.Principals{Items: newGroupPrincipals}
 
 		canAccessProvider := false
 

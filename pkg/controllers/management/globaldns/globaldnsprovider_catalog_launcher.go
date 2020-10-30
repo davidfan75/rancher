@@ -5,16 +5,22 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/rancher/rancher/pkg/controllers/management/globalnamespacerbac"
+	v32 "github.com/rancher/rancher/pkg/apis/project.cattle.io/v3"
+
+	"github.com/rancher/norman/types/convert"
+	passwordutil "github.com/rancher/rancher/pkg/api/norman/store/password"
+	"github.com/rancher/rancher/pkg/catalog/manager"
+	cutils "github.com/rancher/rancher/pkg/catalog/utils"
+	"github.com/rancher/rancher/pkg/controllers/management/rbac"
+	v1 "github.com/rancher/rancher/pkg/generated/norman/core/v1"
+	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
+	pv3 "github.com/rancher/rancher/pkg/generated/norman/project.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/namespace"
 	"github.com/rancher/rancher/pkg/project"
 	"github.com/rancher/rancher/pkg/settings"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	pv3 "github.com/rancher/types/apis/project.cattle.io/v3"
-	"github.com/rancher/types/config"
-	"github.com/rancher/types/user"
+	"github.com/rancher/rancher/pkg/types/config"
+	"github.com/rancher/rancher/pkg/user"
 	"github.com/sirupsen/logrus"
-
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -26,6 +32,7 @@ const (
 	GlobaldnsProviderCatalogLauncher = "mgmt-global-dns-provider-catalog-launcher"
 	cattleCreatorIDAnnotationKey     = "field.cattle.io/creatorId"
 	localClusterName                 = "local"
+	templateName                     = "rancher-external-dns"
 )
 
 type ProviderCatalogLauncher struct {
@@ -34,6 +41,9 @@ type ProviderCatalogLauncher struct {
 	ProjectLister     v3.ProjectLister
 	appLister         pv3.AppLister
 	userManager       user.Manager
+	secrets           v1.SecretInterface
+	templateLister    v3.CatalogTemplateLister
+	catalogManager    manager.CatalogManager
 }
 
 func newGlobalDNSProviderCatalogLauncher(ctx context.Context, mgmt *config.ManagementContext) *ProviderCatalogLauncher {
@@ -43,12 +53,15 @@ func newGlobalDNSProviderCatalogLauncher(ctx context.Context, mgmt *config.Manag
 		ProjectLister:     mgmt.Management.Projects("").Controller().Lister(),
 		appLister:         mgmt.Project.Apps("").Controller().Lister(),
 		userManager:       mgmt.UserManager,
+		secrets:           mgmt.Core.Secrets(""),
+		templateLister:    mgmt.Management.CatalogTemplates(metav1.NamespaceAll).Controller().Lister(),
+		catalogManager:    mgmt.CatalogManager,
 	}
 	return n
 }
 
 //sync is called periodically and on real updates
-func (n *ProviderCatalogLauncher) sync(key string, obj *v3.GlobalDNSProvider) (runtime.Object, error) {
+func (n *ProviderCatalogLauncher) sync(key string, obj *v3.GlobalDnsProvider) (runtime.Object, error) {
 	if obj == nil || obj.DeletionTimestamp != nil {
 		return nil, nil
 	}
@@ -56,13 +69,14 @@ func (n *ProviderCatalogLauncher) sync(key string, obj *v3.GlobalDNSProvider) (r
 	if err != nil {
 		return nil, err
 	}
-	creatorID, ok := metaAccessor.GetAnnotations()[globalnamespacerbac.CreatorIDAnn]
+	creatorID, ok := metaAccessor.GetAnnotations()[rbac.CreatorIDAnn]
 	if !ok {
 		return nil, fmt.Errorf("GlobalDNS %v has no creatorId annotation", metaAccessor.GetName())
 	}
 
-	if err := globalnamespacerbac.CreateRoleAndRoleBinding(globalnamespacerbac.GlobalDNSProviderResource, obj.Name,
-		obj.UID, obj.Spec.Members, creatorID, n.managementContext); err != nil {
+	if err := rbac.CreateRoleAndRoleBinding(rbac.GlobalDNSProviderResource, v3.GlobalDnsProviderGroupVersionKind.Kind, obj.Name, namespace.GlobalNamespace,
+		rbac.RancherManagementAPIVersion, creatorID, []string{rbac.RancherManagementAPIGroup},
+		obj.UID, obj.Spec.Members, n.managementContext); err != nil {
 		return nil, err
 	}
 
@@ -82,14 +96,25 @@ func (n *ProviderCatalogLauncher) sync(key string, obj *v3.GlobalDNSProvider) (r
 	return nil, nil
 }
 
-func (n *ProviderCatalogLauncher) handleRoute53Provider(obj *v3.GlobalDNSProvider) (runtime.Object, error) {
+func (n *ProviderCatalogLauncher) handleRoute53Provider(obj *v3.GlobalDnsProvider) (runtime.Object, error) {
 	rancherInstallUUID := settings.InstallUUID.Get()
 	//create external-dns route53 provider
+
+	secretKey := obj.Spec.Route53ProviderConfig.SecretKey
+	//read the secret if found
+	var err error
+	if strings.HasPrefix(obj.Spec.Route53ProviderConfig.SecretKey, namespace.GlobalNamespace) {
+		secretKey, err = passwordutil.GetValueForPasswordField(obj.Spec.Route53ProviderConfig.SecretKey, n.secrets)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	answers := map[string]string{
 		"provider":            "aws",
 		"aws.zoneType":        obj.Spec.Route53ProviderConfig.ZoneType,
 		"aws.accessKey":       obj.Spec.Route53ProviderConfig.AccessKey,
-		"aws.secretKey":       obj.Spec.Route53ProviderConfig.SecretKey,
+		"aws.secretKey":       secretKey,
 		"txtOwnerId":          rancherInstallUUID + "_" + obj.Name,
 		"rbac.create":         "true",
 		"policy":              "sync",
@@ -104,17 +129,33 @@ func (n *ProviderCatalogLauncher) handleRoute53Provider(obj *v3.GlobalDNSProvide
 	return n.createUpdateExternalDNSApp(obj, answers)
 }
 
-func (n *ProviderCatalogLauncher) handleCloudflareProvider(obj *v3.GlobalDNSProvider) (runtime.Object, error) {
+func (n *ProviderCatalogLauncher) handleCloudflareProvider(obj *v3.GlobalDnsProvider) (runtime.Object, error) {
 	rancherInstallUUID := settings.InstallUUID.Get()
+
+	isProxy := "true"
+	if obj.Spec.CloudflareProviderConfig.ProxySetting != nil {
+		isProxy = convert.ToString(*obj.Spec.CloudflareProviderConfig.ProxySetting)
+	}
+
+	secretAPIKey := obj.Spec.CloudflareProviderConfig.APIKey
+	//read the secret if found
+	var err error
+	if strings.HasPrefix(obj.Spec.CloudflareProviderConfig.APIKey, namespace.GlobalNamespace) {
+		secretAPIKey, err = passwordutil.GetValueForPasswordField(obj.Spec.CloudflareProviderConfig.APIKey, n.secrets)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	//create external-dns route53 provider
 	answers := map[string]string{
 		"provider":           "cloudflare",
-		"cloudflare.apiKey":  obj.Spec.CloudflareProviderConfig.APIKey,
+		"cloudflare.apiKey":  secretAPIKey,
 		"cloudflare.email":   obj.Spec.CloudflareProviderConfig.APIEmail,
 		"txtOwnerId":         rancherInstallUUID + "_" + obj.Name,
 		"rbac.create":        "true",
 		"policy":             "sync",
-		"cloudflare.proxied": obj.Spec.CloudflareProviderConfig.ProxySetting,
+		"cloudflare.proxied": isProxy,
 	}
 
 	if obj.Spec.RootDomain != "" {
@@ -124,14 +165,25 @@ func (n *ProviderCatalogLauncher) handleCloudflareProvider(obj *v3.GlobalDNSProv
 	return n.createUpdateExternalDNSApp(obj, answers)
 }
 
-func (n *ProviderCatalogLauncher) handleAlidnsProvider(obj *v3.GlobalDNSProvider) (runtime.Object, error) {
+func (n *ProviderCatalogLauncher) handleAlidnsProvider(obj *v3.GlobalDnsProvider) (runtime.Object, error) {
 	rancherInstallUUID := settings.InstallUUID.Get()
+
+	secretKey := obj.Spec.AlidnsProviderConfig.SecretKey
+	//read the secret if found
+	var err error
+	if strings.HasPrefix(obj.Spec.AlidnsProviderConfig.SecretKey, namespace.GlobalNamespace) {
+		secretKey, err = passwordutil.GetValueForPasswordField(obj.Spec.AlidnsProviderConfig.SecretKey, n.secrets)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	//create external-dns alidns provider
 	answers := map[string]string{
 		"provider":               "alibabacloud",
 		"alibabacloud.zoneType":  "public",
 		"alibabacloud.accessKey": obj.Spec.AlidnsProviderConfig.AccessKey,
-		"alibabacloud.secretKey": obj.Spec.AlidnsProviderConfig.SecretKey,
+		"alibabacloud.secretKey": secretKey,
 		"txtOwnerId":             rancherInstallUUID + "_" + obj.Name,
 		"rbac.create":            "true",
 		"policy":                 "sync",
@@ -144,7 +196,7 @@ func (n *ProviderCatalogLauncher) handleAlidnsProvider(obj *v3.GlobalDNSProvider
 	return n.createUpdateExternalDNSApp(obj, answers)
 }
 
-func (n *ProviderCatalogLauncher) createUpdateExternalDNSApp(obj *v3.GlobalDNSProvider, answers map[string]string) (runtime.Object, error) {
+func (n *ProviderCatalogLauncher) createUpdateExternalDNSApp(obj *v3.GlobalDnsProvider, answers map[string]string) (runtime.Object, error) {
 	//check if provider already running for this GlobalDNSProvider.
 	existingApp, err := n.getProviderIfAlreadyRunning(obj)
 	if err != nil {
@@ -163,7 +215,10 @@ func (n *ProviderCatalogLauncher) createUpdateExternalDNSApp(obj *v3.GlobalDNSPr
 		}
 	} else {
 		//create new app
-		appCatalogID := settings.SystemExternalDNSCatalogID.Get()
+		appCatalogID, err := n.getExternalDNSCatalogID(localClusterName)
+		if err != nil {
+			return nil, err
+		}
 		sysProject, err := n.getSystemProjectID()
 		if err != nil {
 			return nil, err
@@ -173,7 +228,7 @@ func (n *ProviderCatalogLauncher) createUpdateExternalDNSApp(obj *v3.GlobalDNSPr
 		controller := true
 		ownerRef := []metav1.OwnerReference{{
 			Name:       obj.Name,
-			APIVersion: "v3",
+			APIVersion: obj.APIVersion,
 			UID:        obj.UID,
 			Kind:       obj.Kind,
 			Controller: &controller,
@@ -190,7 +245,7 @@ func (n *ProviderCatalogLauncher) createUpdateExternalDNSApp(obj *v3.GlobalDNSPr
 				Namespace:       sysProject,
 				OwnerReferences: ownerRef,
 			},
-			Spec: pv3.AppSpec{
+			Spec: v32.AppSpec{
 				ProjectName:     localClusterName + ":" + sysProject,
 				TargetNamespace: namespace.GlobalNamespace,
 				ExternalID:      appCatalogID,
@@ -206,7 +261,7 @@ func (n *ProviderCatalogLauncher) createUpdateExternalDNSApp(obj *v3.GlobalDNSPr
 	return nil, nil
 }
 
-func (n *ProviderCatalogLauncher) getProviderIfAlreadyRunning(obj *v3.GlobalDNSProvider) (*pv3.App, error) {
+func (n *ProviderCatalogLauncher) getProviderIfAlreadyRunning(obj *v3.GlobalDnsProvider) (*pv3.App, error) {
 	sysProject, err := n.getSystemProjectID()
 	if err != nil {
 		return nil, err
@@ -230,6 +285,15 @@ func (n *ProviderCatalogLauncher) getSystemProjectID() (string, error) {
 	}
 
 	return systemProject.Name, nil
+}
+
+func (n *ProviderCatalogLauncher) getExternalDNSCatalogID(clusterName string) (string, error) {
+	templateVersionID := n.getRancherExternalDNSTemplateID()
+	return n.catalogManager.GetSystemAppCatalogID(templateVersionID, clusterName)
+}
+
+func (n *ProviderCatalogLauncher) getRancherExternalDNSTemplateID() string {
+	return fmt.Sprintf("%s-%s", cutils.SystemLibraryName, templateName)
 }
 
 func CopyCreatorID(toAnnotations, fromAnnotations map[string]string) map[string]string {

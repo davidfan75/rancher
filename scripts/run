@@ -13,4 +13,5 @@ rm -rf build/testdata
 mkdir -p build/testdata
 cd build/testdata
 export KUBECONFIG=
-exec ../../$CMD --add-local=true
+export CATTLE_DEV_MODE=yes
+exec ../../$CMD --add-local=true --features=multi-cluster-management=true

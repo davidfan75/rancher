@@ -5,14 +5,15 @@ import (
 	"fmt"
 	"strings"
 
+	v32 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+
 	"github.com/pkg/errors"
 	"github.com/rancher/norman/httperror"
 	"github.com/rancher/norman/types"
 	"github.com/rancher/rancher/pkg/auth/providers/common"
 	"github.com/rancher/rancher/pkg/auth/tokens"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	"github.com/rancher/types/apis/management.cattle.io/v3public"
-	"github.com/rancher/types/config"
+	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/types/config"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -74,8 +75,8 @@ func (l *Provider) CustomizeSchema(schema *types.Schema) {
 	schema.ActionHandler = l.actionHandler
 }
 
-func (l *Provider) TransformToAuthProvider(authConfig map[string]interface{}) map[string]interface{} {
-	return common.TransformToAuthProvider(authConfig)
+func (l *Provider) TransformToAuthProvider(authConfig map[string]interface{}) (map[string]interface{}, error) {
+	return common.TransformToAuthProvider(authConfig), nil
 }
 
 func (l *Provider) getUser(username string) (*v3.User, error) {
@@ -99,8 +100,8 @@ func (l *Provider) getUser(username string) (*v3.User, error) {
 	return user, nil
 }
 
-func (l *Provider) AuthenticateUser(input interface{}) (v3.Principal, []v3.Principal, string, error) {
-	localInput, ok := input.(*v3public.BasicLogin)
+func (l *Provider) AuthenticateUser(ctx context.Context, input interface{}) (v3.Principal, []v3.Principal, string, error) {
+	localInput, ok := input.(*v32.BasicLogin)
 	if !ok {
 		return v3.Principal{}, nil, "", httperror.NewAPIError(httperror.ServerError, "Unexpected input type")
 	}
@@ -140,6 +141,9 @@ func getLocalPrincipalID(user *v3.User) string {
 		if strings.HasPrefix(p, Name+"://") {
 			principalID = p
 		}
+	}
+	if principalID == "" {
+		return Name + "://" + user.Name
 	}
 	return principalID
 }

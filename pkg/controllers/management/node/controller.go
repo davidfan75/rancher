@@ -2,40 +2,70 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base32"
 	"encoding/json"
 	"fmt"
-	"github.com/rancher/norman/types/convert"
-	"github.com/rancher/rancher/pkg/namespace"
+	"io/ioutil"
+	"os"
+	"path"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/rancher/norman/objectclient"
+	"github.com/rancher/norman/types/convert"
 	"github.com/rancher/norman/types/values"
-	"github.com/rancher/rancher/pkg/api/customization/clusterregistrationtokens"
+	"github.com/rancher/rancher/pkg/api/norman/customization/clusterregistrationtokens"
+	v32 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/clustermanager"
+	"github.com/rancher/rancher/pkg/controllers/management/drivers/nodedriver"
 	"github.com/rancher/rancher/pkg/encryptedstore"
+	corev1 "github.com/rancher/rancher/pkg/generated/norman/core/v1"
+	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/jailer"
+	"github.com/rancher/rancher/pkg/kubectl"
+	"github.com/rancher/rancher/pkg/namespace"
+	nodehelper "github.com/rancher/rancher/pkg/node"
 	"github.com/rancher/rancher/pkg/nodeconfig"
 	"github.com/rancher/rancher/pkg/ref"
 	"github.com/rancher/rancher/pkg/systemaccount"
-	corev1 "github.com/rancher/types/apis/core/v1"
-	"github.com/rancher/types/apis/management.cattle.io/v3"
-	"github.com/rancher/types/config"
+	"github.com/rancher/rancher/pkg/taints"
+	"github.com/rancher/rancher/pkg/types/config"
+	"github.com/rancher/rancher/pkg/user"
+	rketypes "github.com/rancher/rke/types"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	kerror "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	typedv1 "k8s.io/client-go/kubernetes/typed/core/v1"
 )
 
 const (
-	defaultEngineInstallURL = "https://releases.rancher.com/install-docker/17.03.2.sh"
-	amazonec2               = "amazonec2"
+	defaultEngineInstallURL         = "https://releases.rancher.com/install-docker/17.03.2.sh"
+	amazonec2                       = "amazonec2"
+	userNodeRemoveCleanupAnnotation = "nodes.management.cattle.io/user-node-remove-cleanup"
 )
 
-func Register(ctx context.Context, management *config.ManagementContext) {
+// aliases maps Schema field => driver field
+// The opposite of this lives in pkg/controllers/management/drivers/nodedriver/machine_driver.go
+var aliases = map[string]map[string]string{
+	"aliyunecs":     map[string]string{"sshKeyContents": "sshKeypath"},
+	"amazonec2":     map[string]string{"sshKeyContents": "sshKeypath", "userdata": "userdata"},
+	"azure":         map[string]string{"customData": "customData"},
+	"digitalocean":  map[string]string{"sshKeyContents": "sshKeyPath", "userdata": "userdata"},
+	"exoscale":      map[string]string{"sshKey": "sshKey", "userdata": "userdata"},
+	"openstack":     map[string]string{"cacert": "cacert", "privateKeyFile": "privateKeyFile", "userDataFile": "userDataFile"},
+	"otc":           map[string]string{"privateKeyFile": "privateKeyFile"},
+	"packet":        map[string]string{"userdata": "userdata"},
+	"vmwarevsphere": map[string]string{"cloudConfig": "cloud-config"},
+}
+
+func Register(ctx context.Context, management *config.ManagementContext, clusterManager *clustermanager.Manager) {
 	secretStore, err := nodeconfig.NewStore(management.Core.Namespaces(""), management.Core)
 	if err != nil {
 		logrus.Fatal(err)
@@ -44,34 +74,44 @@ func Register(ctx context.Context, management *config.ManagementContext) {
 	nodeClient := management.Management.Nodes("")
 
 	nodeLifecycle := &Lifecycle{
+		ctx:                       ctx,
 		systemAccountManager:      systemaccount.NewManager(management),
 		secretStore:               secretStore,
 		nodeClient:                nodeClient,
 		nodeTemplateClient:        management.Management.NodeTemplates(""),
+		nodePoolLister:            management.Management.NodePools("").Controller().Lister(),
 		nodeTemplateGenericClient: management.Management.NodeTemplates("").ObjectClient().UnstructuredClient(),
 		configMapGetter:           management.K8sClient.CoreV1(),
 		clusterLister:             management.Management.Clusters("").Controller().Lister(),
 		schemaLister:              management.Management.DynamicSchemas("").Controller().Lister(),
 		credLister:                management.Core.Secrets("").Controller().Lister(),
+		userManager:               management.UserManager,
+		clusterManager:            clusterManager,
+		devMode:                   os.Getenv("CATTLE_DEV_MODE") != "",
 	}
 
 	nodeClient.AddLifecycle(ctx, "node-controller", nodeLifecycle)
 }
 
 type Lifecycle struct {
+	ctx                       context.Context
 	systemAccountManager      *systemaccount.Manager
 	secretStore               *encryptedstore.GenericEncryptedStore
 	nodeTemplateGenericClient objectclient.GenericClient
 	nodeClient                v3.NodeInterface
 	nodeTemplateClient        v3.NodeTemplateInterface
+	nodePoolLister            v3.NodePoolLister
 	configMapGetter           typedv1.ConfigMapsGetter
 	clusterLister             v3.ClusterLister
 	schemaLister              v3.DynamicSchemaLister
 	credLister                corev1.SecretLister
+	userManager               user.Manager
+	clusterManager            *clustermanager.Manager
+	devMode                   bool
 }
 
 func (m *Lifecycle) setupCustom(obj *v3.Node) {
-	obj.Status.NodeConfig = &v3.RKEConfigNode{
+	obj.Status.NodeConfig = &rketypes.RKEConfigNode{
 		NodeName:         obj.Namespace + ":" + obj.Name,
 		HostnameOverride: obj.Spec.RequestedHostname,
 		Address:          obj.Spec.CustomConfig.Address,
@@ -82,6 +122,7 @@ func (m *Lifecycle) setupCustom(obj *v3.Node) {
 		Labels:           obj.Spec.CustomConfig.Label,
 		Port:             "22",
 		Role:             roles(obj),
+		Taints:           taints.GetRKETaintsFromStrings(obj.Spec.CustomConfig.Taints),
 	}
 
 	if obj.Status.NodeConfig.User == "" {
@@ -101,14 +142,14 @@ func isCustom(obj *v3.Node) bool {
 }
 
 func (m *Lifecycle) setWaiting(node *v3.Node) {
-	v3.NodeConditionRegistered.IsUnknown(node)
-	v3.NodeConditionRegistered.Message(node, "waiting to register with Kubernetes")
+	v32.NodeConditionRegistered.IsUnknown(node)
+	v32.NodeConditionRegistered.Message(node, "waiting to register with Kubernetes")
 }
 
 func (m *Lifecycle) Create(obj *v3.Node) (runtime.Object, error) {
 	if isCustom(obj) {
 		m.setupCustom(obj)
-		newObj, err := v3.NodeConditionInitialized.Once(obj, func() (runtime.Object, error) {
+		newObj, err := v32.NodeConditionInitialized.Once(obj, func() (runtime.Object, error) {
 			if err := validateCustomHost(obj); err != nil {
 				return obj, err
 			}
@@ -122,7 +163,28 @@ func (m *Lifecycle) Create(obj *v3.Node) (runtime.Object, error) {
 		return obj, nil
 	}
 
-	newObj, err := v3.NodeConditionInitialized.Once(obj, func() (runtime.Object, error) {
+	newObj, err := v32.NodeConditionInitialized.Once(obj, func() (runtime.Object, error) {
+		logrus.Debugf("Called v3.NodeConditionInitialized.Once for [%s] in namespace [%s]", obj.Name, obj.Namespace)
+		// Ensure jail is created first, else the function `NewNodeConfig` will create the full jail path (including parent jail directory) and CreateJail will remove the directory as it does not contain a done file
+		if !m.devMode {
+			err := jailer.CreateJail(obj.Namespace)
+			if err != nil {
+				return nil, errors.WithMessage(err, "node create jail error")
+			}
+		}
+
+		nodeConfig, err := nodeconfig.NewNodeConfig(m.secretStore, obj)
+		if err != nil {
+			return obj, errors.WithMessagef(err, "failed to create node driver config for node [%v]", obj.Name)
+		}
+
+		defer nodeConfig.Cleanup()
+
+		err = m.refreshNodeConfig(nodeConfig, obj)
+		if err != nil {
+			return nil, errors.WithMessagef(err, "unable to create config for node %v", obj.Name)
+		}
+
 		template, err := m.getNodeTemplate(obj.Spec.NodeTemplateName)
 		if err != nil {
 			return obj, err
@@ -136,34 +198,7 @@ func (m *Lifecycle) Create(obj *v3.Node) (runtime.Object, error) {
 			obj.Status.NodeTemplateSpec.EngineInstallURL = defaultEngineInstallURL
 		}
 
-		rawTemplate, err := m.nodeTemplateGenericClient.GetNamespaced(template.Namespace, template.Name, metav1.GetOptions{})
-		if err != nil {
-			return obj, err
-		}
-		data := rawTemplate.(*unstructured.Unstructured).Object
-		rawConfig, ok := values.GetValue(data, template.Spec.Driver+"Config")
-		if !ok {
-			return obj, fmt.Errorf("node config not specified")
-		}
-		if template.Spec.Driver == amazonec2 {
-			setEc2ClusterIDTag(rawConfig, obj.Namespace)
-		}
-		if err := m.updateRawConfigFromCredential(data, rawConfig, template); err != nil {
-			return obj, err
-		}
-		bytes, err := json.Marshal(rawConfig)
-		if err != nil {
-			return obj, errors.Wrap(err, "failed to marshal node driver config")
-		}
-		config, err := nodeconfig.NewNodeConfig(m.secretStore, obj)
-		if err != nil {
-			return obj, errors.Wrap(err, "failed to save node driver config")
-		}
-		defer config.Cleanup()
-
-		config.SetDriverConfig(string(bytes))
-
-		return obj, config.Save()
+		return obj, nil
 	})
 
 	return newObj.(*v3.Node), err
@@ -171,7 +206,13 @@ func (m *Lifecycle) Create(obj *v3.Node) (runtime.Object, error) {
 
 func (m *Lifecycle) getNodeTemplate(nodeTemplateName string) (*v3.NodeTemplate, error) {
 	ns, n := ref.Parse(nodeTemplateName)
+	logrus.Debugf("getNodeTemplate parsed [%s] to ns: [%s] and n: [%s]", nodeTemplateName, ns, n)
 	return m.nodeTemplateClient.GetNamespaced(ns, n, metav1.GetOptions{})
+}
+
+func (m *Lifecycle) getNodePool(nodePoolName string) (*v3.NodePool, error) {
+	ns, p := ref.Parse(nodePoolName)
+	return m.nodePoolLister.Get(ns, p)
 }
 
 func (m *Lifecycle) Remove(obj *v3.Node) (runtime.Object, error) {
@@ -179,7 +220,7 @@ func (m *Lifecycle) Remove(obj *v3.Node) (runtime.Object, error) {
 		return obj, nil
 	}
 
-	newObj, err := v3.NodeConditionRemoved.DoUntilTrue(obj, func() (runtime.Object, error) {
+	newObj, err := v32.NodeConditionRemoved.DoUntilTrue(obj, func() (runtime.Object, error) {
 		found, err := m.isNodeInAppliedSpec(obj)
 		if err != nil {
 			return obj, err
@@ -187,22 +228,40 @@ func (m *Lifecycle) Remove(obj *v3.Node) (runtime.Object, error) {
 		if found {
 			return obj, errors.New("waiting for node to be removed from cluster")
 		}
+
+		if !m.devMode {
+			err := jailer.CreateJail(obj.Namespace)
+			if err != nil {
+				return nil, errors.WithMessage(err, "node remove jail error")
+			}
+		}
+
 		config, err := nodeconfig.NewNodeConfig(m.secretStore, obj)
 		if err != nil {
 			return obj, err
 		}
+
 		if err := config.Restore(); err != nil {
 			return obj, err
 		}
+
 		defer config.Remove()
 
-		mExists, err := nodeExists(config.Dir(), obj.Spec.RequestedHostname)
+		err = m.refreshNodeConfig(config, obj)
+		if err != nil {
+			return nil, errors.WithMessagef(err, "unable to refresh config for node %v", obj.Name)
+		}
+
+		mExists, err := nodeExists(config.Dir(), obj)
 		if err != nil {
 			return obj, err
 		}
 
 		if mExists {
 			logrus.Infof("Removing node %s", obj.Spec.RequestedHostname)
+			if err := m.drainNode(obj); err != nil {
+				return obj, err
+			}
 			if err := deleteNode(config.Dir(), obj); err != nil {
 				return obj, err
 			}
@@ -212,7 +271,11 @@ func (m *Lifecycle) Remove(obj *v3.Node) (runtime.Object, error) {
 		return obj, nil
 	})
 
-	return newObj.(*v3.Node), err
+	if err != nil {
+		return newObj.(*v3.Node), err
+	}
+
+	return m.deleteV1Node(newObj.(*v3.Node))
 }
 
 func (m *Lifecycle) provision(driverConfig, nodeDir string, obj *v3.Node) (*v3.Node, error) {
@@ -227,8 +290,17 @@ func (m *Lifecycle) provision(driverConfig, nodeDir string, obj *v3.Node) (*v3.N
 		return obj, err
 	}
 
+	err = aliasToPath(obj.Status.NodeTemplateSpec.Driver, configRawMap, obj.Namespace)
+	if err != nil {
+		return obj, err
+	}
+
 	createCommandsArgs := buildCreateCommand(obj, configRawMap)
-	cmd := buildCommand(nodeDir, createCommandsArgs)
+	cmd, err := buildCommand(nodeDir, obj, createCommandsArgs)
+	if err != nil {
+		return obj, err
+	}
+
 	logrus.Infof("Provisioning node %s", obj.Spec.RequestedHostname)
 
 	stdoutReader, stderrReader, err := startReturnOutput(cmd)
@@ -256,15 +328,80 @@ func (m *Lifecycle) provision(driverConfig, nodeDir string, obj *v3.Node) (*v3.N
 	return obj, nil
 }
 
+func aliasToPath(driver string, config map[string]interface{}, ns string) error {
+	devMode := os.Getenv("CATTLE_DEV_MODE") != ""
+	baseDir := path.Join("/opt/jail", ns)
+	if devMode {
+		baseDir = os.TempDir()
+	}
+	// Check if the required driver has aliased fields
+	if fields, ok := aliases[driver]; ok {
+		hasher := sha256.New()
+		for schemaField, driverField := range fields {
+			if fileRaw, ok := config[schemaField]; ok {
+				fileContents := fileRaw.(string)
+				// Delete our aliased fields
+				delete(config, schemaField)
+				if fileContents == "" {
+					continue
+				}
+
+				fileName := driverField
+				if ok := nodedriver.SSHKeyFields[schemaField]; ok {
+					fileName = "id_rsa"
+				}
+
+				// The ending newline gets stripped, add em back
+				if !strings.HasSuffix(fileContents, "\n") {
+					fileContents = fileContents + "\n"
+				}
+
+				hasher.Reset()
+				hasher.Write([]byte(fileContents))
+				sha := base32.StdEncoding.WithPadding(-1).EncodeToString(hasher.Sum(nil))[:10]
+
+				fileDir := path.Join(baseDir, sha)
+
+				// Delete the fileDir path if it's not a directory
+				if info, err := os.Stat(fileDir); err == nil && !info.IsDir() {
+					if err := os.Remove(fileDir); err != nil {
+						return err
+					}
+				}
+
+				err := os.MkdirAll(fileDir, 0755)
+				if err != nil {
+					return err
+				}
+				fullPath := path.Join(fileDir, fileName)
+				err = ioutil.WriteFile(fullPath, []byte(fileContents), 0600)
+				if err != nil {
+					return err
+				}
+				// Add the field and path
+				if devMode {
+					config[driverField] = fullPath
+				} else {
+					config[driverField] = path.Join("/", sha, fileName)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (m *Lifecycle) deployAgent(nodeDir string, obj *v3.Node) error {
 	token, err := m.systemAccountManager.GetOrCreateSystemClusterToken(obj.Namespace)
 	if err != nil {
 		return err
 	}
 
-	drun := clusterregistrationtokens.NodeCommand(token)
+	drun := clusterregistrationtokens.NodeCommand(token, nil)
 	args := buildAgentCommand(obj, drun)
-	cmd := buildCommand(nodeDir, args)
+	cmd, err := buildCommand(nodeDir, obj, args)
+	if err != nil {
+		return err
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return errors.Wrap(err, string(output))
@@ -282,6 +419,11 @@ func (m *Lifecycle) ready(obj *v3.Node) (*v3.Node, error) {
 
 	if err := config.Restore(); err != nil {
 		return obj, err
+	}
+
+	err = m.refreshNodeConfig(config, obj)
+	if err != nil {
+		return nil, errors.WithMessagef(err, "unable to refresh config for node %v", obj.Name)
 	}
 
 	driverConfig, err := config.DriverConfig()
@@ -308,8 +450,8 @@ outer:
 		}
 	}
 
-	newObj, saveError := v3.NodeConditionConfigSaved.Once(obj, func() (runtime.Object, error) {
-		return m.saveConfig(config, config.Dir(), obj)
+	newObj, saveError := v32.NodeConditionConfigSaved.Once(obj, func() (runtime.Object, error) {
+		return m.saveConfig(config, config.FullDir(), obj)
 	})
 	obj = newObj.(*v3.Node)
 	if err == nil {
@@ -319,15 +461,23 @@ outer:
 }
 
 func (m *Lifecycle) Updated(obj *v3.Node) (runtime.Object, error) {
-	obj, err := m.checkLabels(obj)
-	if err != nil {
-		return obj, err
+	if cleanupAnnotation, ok := obj.Annotations[userNodeRemoveCleanupAnnotation]; !ok || cleanupAnnotation != "true" {
+		// finalizer from user-node-remove has to be checked/cleaned
+		return m.userNodeRemoveCleanup(obj)
 	}
 
-	newObj, err := v3.NodeConditionProvisioned.Once(obj, func() (runtime.Object, error) {
+	newObj, err := v32.NodeConditionProvisioned.Once(obj, func() (runtime.Object, error) {
 		if obj.Status.NodeTemplateSpec == nil {
 			m.setWaiting(obj)
 			return obj, nil
+		}
+
+		if !m.devMode {
+			logrus.Infof("Creating jail for %v", obj.Namespace)
+			err := jailer.CreateJail(obj.Namespace)
+			if err != nil {
+				return nil, errors.WithMessage(err, "node update jail error")
+			}
 		}
 
 		obj, err := m.ready(obj)
@@ -355,7 +505,12 @@ func (m *Lifecycle) saveConfig(config *nodeconfig.NodeConfig, nodeDir string, ob
 		return obj, err
 	}
 
-	sshKey, err := getSSHKey(nodeDir, obj)
+	keyPath, err := config.SSHKeyPath()
+	if err != nil {
+		return obj, err
+	}
+
+	sshKey, err := getSSHKey(nodeDir, keyPath, obj)
 	if err != nil {
 		return obj, err
 	}
@@ -374,7 +529,12 @@ func (m *Lifecycle) saveConfig(config *nodeconfig.NodeConfig, nodeDir string, ob
 		return obj, err
 	}
 
-	obj.Status.NodeConfig = &v3.RKEConfigNode{
+	pool, err := m.getNodePool(obj.Spec.NodePoolName)
+	if err != nil {
+		return obj, err
+	}
+
+	obj.Status.NodeConfig = &rketypes.RKEConfigNode{
 		NodeName:         obj.Namespace + ":" + obj.Name,
 		Address:          ip,
 		InternalAddress:  interalAddress,
@@ -395,7 +555,78 @@ func (m *Lifecycle) saveConfig(config *nodeconfig.NodeConfig, nodeDir string, ob
 		obj.Status.NodeConfig.Role = []string{"worker"}
 	}
 
+	templateSet := taints.GetKeyEffectTaintSet(template.Spec.NodeTaints)
+	nodeSet := taints.GetKeyEffectTaintSet(pool.Spec.NodeTaints)
+	expectTaints := pool.Spec.NodeTaints
+
+	for key, ti := range templateSet {
+		// the expect taints are based on the node pool. so we don't need to set taints with same key and effect by template because
+		// the taints from node pool should override the taints from template.
+		if _, ok := nodeSet[key]; !ok {
+			expectTaints = append(expectTaints, template.Spec.NodeTaints[ti])
+		}
+	}
+	obj.Status.NodeConfig.Taints = taints.GetRKETaintsFromTaints(expectTaints)
+
 	return obj, nil
+}
+
+func (m *Lifecycle) refreshNodeConfig(nc *nodeconfig.NodeConfig, obj *v3.Node) error {
+	template, err := m.getNodeTemplate(obj.Spec.NodeTemplateName)
+	if err != nil {
+		return err
+	}
+
+	rawTemplate, err := m.nodeTemplateGenericClient.GetNamespaced(template.Namespace, template.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	data := rawTemplate.(*unstructured.Unstructured).Object
+	rawConfig, ok := values.GetValue(data, template.Spec.Driver+"Config")
+	if !ok {
+		return fmt.Errorf("refreshNodeConfig: node config not specified for node %v", obj.Name)
+	}
+
+	if err := m.updateRawConfigFromCredential(data, rawConfig, template); err != nil {
+		logrus.Debugf("refreshNodeConfig: error calling updateRawConfigFromCredential for [%v]: %v", obj.Name, err)
+		return err
+	}
+
+	var update bool
+
+	if template.Spec.Driver == amazonec2 {
+		setEc2ClusterIDTag(rawConfig, obj.Namespace)
+		logrus.Debug("refreshNodeConfig: Updating amazonec2 machine config")
+		//TODO: Update to not be amazon specific, this needs to be moved to the driver
+		update, err = nc.UpdateAmazonAuth(rawConfig)
+		if err != nil {
+			return err
+		}
+	}
+
+	bytes, err := json.Marshal(rawConfig)
+	if err != nil {
+		return errors.Wrap(err, "failed to marshal node driver config")
+	}
+
+	newConfig := string(bytes)
+
+	currentConfig, err := nc.DriverConfig()
+	if err != nil {
+		return err
+	}
+
+	if currentConfig != newConfig || update {
+		err = nc.SetDriverConfig(string(bytes))
+		if err != nil {
+			return err
+		}
+
+		return nc.Save()
+	}
+
+	return nil
 }
 
 func (m *Lifecycle) isNodeInAppliedSpec(node *v3.Node) (bool, error) {
@@ -475,7 +706,7 @@ func roles(node *v3.Node) []string {
 	return roles
 }
 
-func (m *Lifecycle) setCredFields(data interface{}, fields map[string]v3.Field, credID string) error {
+func (m *Lifecycle) setCredFields(data interface{}, fields map[string]v32.Field, credID string) error {
 	splitID := strings.Split(credID, ":")
 	if len(splitID) != 2 {
 		return fmt.Errorf("invalid credential id %s", credID)
@@ -511,4 +742,129 @@ func (m *Lifecycle) updateRawConfigFromCredential(data map[string]interface{}, r
 		}
 	}
 	return nil
+}
+
+func (m *Lifecycle) deleteV1Node(node *v3.Node) (runtime.Object, error) {
+	logrus.Debugf("Deleting v1.node for [%v] node", node.Status.NodeName)
+	if nodehelper.IgnoreNode(node.Status.NodeName, node.Status.NodeLabels) {
+		logrus.Debugf("Skipping v1.node removal for [%v] node", node.Status.NodeName)
+		return node, nil
+	}
+
+	if node.Status.NodeName == "" {
+		return node, nil
+	}
+
+	userClient, err := m.clusterManager.UserContext(node.Namespace)
+	if err != nil {
+		if kerror.IsNotFound(err) {
+			return node, nil
+		}
+		return node, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.TODO(), 45*time.Second)
+	defer cancel()
+	err = userClient.K8sClient.CoreV1().Nodes().Delete(
+		ctx, node.Status.NodeName, metav1.DeleteOptions{})
+	if !kerror.IsNotFound(err) && ctx.Err() != context.DeadlineExceeded {
+		return node, err
+	}
+
+	return node, nil
+}
+
+func (m *Lifecycle) drainNode(node *v3.Node) error {
+	nodeCopy := node.DeepCopy() // copy for cache protection as we do no updating but need things set for the drain
+	cluster, err := m.clusterLister.Get("", nodeCopy.Namespace)
+	if err != nil {
+		if kerror.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	if !nodehelper.DrainBeforeDelete(nodeCopy, cluster) {
+		return nil
+	}
+
+	logrus.Infof("node [%s] requires draining before delete", nodeCopy.Spec.RequestedHostname)
+	kubeConfig, err := m.getKubeConfig(cluster)
+	if err != nil {
+		return fmt.Errorf("node [%s] error getting kubeConfig", nodeCopy.Spec.RequestedHostname)
+	}
+
+	if nodeCopy.Spec.NodeDrainInput == nil {
+		logrus.Debugf("node [%s] has no NodeDrainInput, creating one with 60s timeout",
+			nodeCopy.Spec.RequestedHostname)
+		nodeCopy.Spec.NodeDrainInput = &rketypes.NodeDrainInput{
+			Force:           false,
+			DeleteLocalData: false,
+			GracePeriod:     60,
+			Timeout:         60,
+		}
+	}
+
+	backoff := wait.Backoff{
+		Duration: 2 * time.Second,
+		Factor:   1,
+		Jitter:   0,
+		Steps:    3,
+	}
+
+	logrus.Infof("node [%s] attempting to drain, retrying up to 3 times", nodeCopy.Spec.RequestedHostname)
+	// purposefully ignoring error, if the drain fails this falls back to deleting the node as usual
+	wait.ExponentialBackoff(backoff, func() (bool, error) {
+		ctx, cancel := context.WithTimeout(m.ctx, time.Duration(nodeCopy.Spec.NodeDrainInput.Timeout)*time.Second)
+		defer cancel()
+
+		_, msg, err := kubectl.Drain(ctx, kubeConfig, nodeCopy.Status.NodeName, nodehelper.GetDrainFlags(nodeCopy))
+		if ctx.Err() != nil {
+			logrus.Errorf("node [%s] kubectl drain failed, retrying: %s", nodeCopy.Spec.RequestedHostname, ctx.Err())
+			return false, nil
+		}
+		if err != nil {
+			// kubectl failed continue on with delete any way
+			logrus.Errorf("node [%s] kubectl drain error, retrying: %s", nodeCopy.Spec.RequestedHostname, err)
+			return false, nil
+		}
+
+		logrus.Infof("node [%s] kubectl drain response: %s", nodeCopy.Spec.RequestedHostname, msg)
+		return true, nil
+	})
+
+	return nil
+}
+
+func (m *Lifecycle) userNodeRemoveCleanup(obj *v3.Node) (runtime.Object, error) {
+	copy := obj.DeepCopy()
+	copy.Annotations[userNodeRemoveCleanupAnnotation] = "true"
+	if hasFinalizerWithPrefix(copy, "clusterscoped.controller.cattle.io/user-node-remove_") {
+		// user-node-remove controller functionality is now merged into this controller
+		logrus.Infof("node [%s] has a finalizer for user-node-remove controller and it will be removed",
+			copy.Spec.RequestedHostname)
+		copy = removeFinalizerWithPrefix(copy, "clusterscoped.controller.cattle.io/user-node-remove_")
+	}
+	return m.nodeClient.Update(copy)
+}
+
+func hasFinalizerWithPrefix(node *v3.Node, prefix string) bool {
+	for _, finalizer := range node.Finalizers {
+		if strings.HasPrefix(finalizer, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func removeFinalizerWithPrefix(node *v3.Node, prefix string) *v3.Node {
+	var newFinalizers []string
+	for _, finalizer := range node.Finalizers {
+		if strings.HasPrefix(finalizer, prefix) {
+			continue
+		}
+		newFinalizers = append(newFinalizers, finalizer)
+	}
+	node.SetFinalizers(newFinalizers)
+	return node
 }

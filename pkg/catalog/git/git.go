@@ -8,17 +8,21 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	catUtil "github.com/rancher/rancher/pkg/catalog/utils"
 )
 
 func Clone(path, url, branch string) error {
+	if err := catUtil.ValidateURL(url); err != nil {
+		return err
+	}
 	return runcmd("git", "clone", "-b", branch, "--single-branch", url, path)
 }
 
-func Update(path, branch string) error {
+func Update(path, commit string) error {
 	if err := runcmd("git", "-C", path, "fetch"); err != nil {
 		return err
 	}
-	return runcmd("git", "-C", path, "checkout", fmt.Sprintf("origin/%s", branch))
+	return runcmd("git", "-C", path, "checkout", commit)
 }
 
 func HeadCommit(path string) (string, error) {
@@ -28,16 +32,25 @@ func HeadCommit(path string) (string, error) {
 }
 
 func RemoteBranchHeadCommit(url, branch string) (string, error) {
+	if err := catUtil.ValidateURL(url); err != nil {
+		return "", err
+	}
 	cmd := exec.Command("git", "ls-remote", url, branch)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", errors.Wrap(err, string(output))
 	}
 	parts := strings.Split(string(output), "\t")
-	return parts[0], nil
+	if len(parts) > 0 && len(parts[0]) > 0 {
+		return parts[0], nil
+	}
+	return "", fmt.Errorf("no commit found for url %s branch %s", branch, url)
 }
 
 func IsValid(url string) bool {
+	if err := catUtil.ValidateURL(url); err != nil {
+		return false
+	}
 	err := runcmd("git", "ls-remote", url)
 	return err == nil
 }
@@ -61,4 +74,11 @@ func FormatURL(pathURL, username, password string) string {
 		}
 	}
 	return pathURL
+}
+
+func CloneWithDepth(path, url, branch string, depth int) error {
+	if err := catUtil.ValidateURL(url); err != nil {
+		return err
+	}
+	return runcmd("git", "clone", "-b", branch, "--single-branch", fmt.Sprintf("--depth=%v", depth), url, path)
 }

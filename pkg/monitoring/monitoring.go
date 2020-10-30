@@ -7,8 +7,12 @@ import (
 	"strings"
 
 	"github.com/rancher/norman/types"
+	v32 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/catalog/manager"
+	cutils "github.com/rancher/rancher/pkg/catalog/utils"
+	mgmtv3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
+	ns "github.com/rancher/rancher/pkg/namespace"
 	"github.com/rancher/rancher/pkg/ref"
-	mgmtv3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -22,6 +26,7 @@ const (
 )
 
 const (
+	istioNamespaceName                     = "istio-system"
 	cattleNamespaceName                    = "cattle-prometheus"
 	cattleCreatorIDAnnotationKey           = "field.cattle.io/creatorId"
 	cattleOverwriteAppAnswersAnnotationKey = "field.cattle.io/overwriteAppAnswers"
@@ -43,15 +48,27 @@ const (
 	clusterLevelAppName             = "cluster-monitoring"
 	projectLevelAppName             = "project-monitoring"
 	clusterLevelAlertManagerAppName = "cluster-alerting"
+	IstioAppName                    = "cluster-istio"
 
 	// The headless service name of Prometheus
 	alertManagerHeadlessServiceName = "alertmanager-operated"
 	prometheusHeadlessServiceName   = "prometheus-operated"
 
+	// The service name of istio prometheus
+	istioPrometheusServiceName = "prometheus"
+
+	istioMonitoringTypeClusterMonitoring = "cluster-monitoring"
+	istioMonitoringTypesBuiltIn          = "built-in"
+	istioMonitoringTypesCustom           = "custom"
+
 	//CattlePrometheusRuleLabelKey The label info of PrometheusRule
 	CattlePrometheusRuleLabelKey             = "source"
 	CattleAlertingPrometheusRuleLabelValue   = "rancher-alert"
 	CattleMonitoringPrometheusRuleLabelValue = "rancher-monitoring"
+	RancherMonitoringTemplateName            = "system-library-rancher-monitoring"
+
+	monitoringTemplateName = "rancher-monitoring"
+	webhookSecreteName     = "webhook-receiver"
 )
 
 var (
@@ -108,6 +125,13 @@ func OwnedLabels(appName, appTargetNamespace, appProjectName string, level AppLe
 	}
 }
 
+func IstioPrometheusEndpoint(answers map[string]string) (serviceName, namespace, port string) {
+	if answers["global.monitoring.type"] == istioMonitoringTypeClusterMonitoring {
+		return prometheusHeadlessServiceName, cattleNamespaceName, "9090"
+	}
+	return istioPrometheusServiceName, istioNamespaceName, "9090"
+}
+
 func SystemMonitoringInfo() (appName, appTargetNamespace string) {
 	return systemLevelAppName, cattleNamespaceName
 }
@@ -118,6 +142,10 @@ func ClusterMonitoringInfo() (appName, appTargetNamespace string) {
 
 func ClusterAlertManagerInfo() (appName, appTargetNamespace string) {
 	return clusterLevelAlertManagerAppName, cattleNamespaceName
+}
+
+func SecretWebhook() (secretName, appTargetNamespace string) {
+	return webhookSecreteName, cattleNamespaceName
 }
 
 func ProjectMonitoringInfo(projectName string) (appName, appTargetNamespace string) {
@@ -136,7 +164,7 @@ func ProjectPrometheusEndpoint(projectName string) (headlessServiceName, namespa
 	return prometheusHeadlessServiceName, fmt.Sprintf("%s-%s", cattleNamespaceName, projectName), "9090"
 }
 
-/*OverwriteAppAnswers Usage
+/*OverwriteAppAnswersAndCatalogID Usage
 ## special key prefix
 _tpl- [priority low] ->  regex ${value} = ${middle-prefix}#(${root1,root2,...}), then generate ${root*}.${middle-prefix} as prefix-key
 
@@ -179,9 +207,9 @@ grafana.persistence.accessMode       	| ReadWriteOnce
 grafana.persistence.size             	| 50Gi
 
 */
-func OverwriteAppAnswers(rawAnswers map[string]string, annotations map[string]string) map[string]string {
-	overwriteAnswers := GetOverwroteAppAnswers(annotations)
-
+func OverwriteAppAnswersAndCatalogID(rawAnswers map[string]string, annotations map[string]string,
+	catalogTemplateLister mgmtv3.CatalogTemplateLister, catalogManager manager.CatalogManager, clusterName string) (map[string]string, string, error) {
+	overwriteAnswers, version := GetOverwroteAppAnswersAndVersion(annotations)
 	for specialKey, value := range overwriteAnswers {
 		if strings.HasPrefix(specialKey, "_tpl-") {
 			trr := tplRegexp.translate(value)
@@ -204,8 +232,25 @@ func OverwriteAppAnswers(rawAnswers map[string]string, annotations map[string]st
 	for key, value := range overwriteAnswers {
 		rawAnswers[key] = value
 	}
+	catalogID, err := GetMonitoringCatalogID(version, catalogTemplateLister, catalogManager, clusterName)
 
-	return rawAnswers
+	return rawAnswers, catalogID, err
+}
+
+func GetMonitoringCatalogID(version string, catalogTemplateLister mgmtv3.CatalogTemplateLister, catalogManager manager.CatalogManager, clusterName string) (string, error) {
+	if version == "" {
+		template, err := catalogTemplateLister.Get(ns.GlobalNamespace, RancherMonitoringTemplateName)
+		if err != nil {
+			return "", err
+		}
+
+		templateVersion, err := catalogManager.LatestAvailableTemplateVersion(template, clusterName)
+		if err != nil {
+			return "", err
+		}
+		version = templateVersion.Version
+	}
+	return fmt.Sprintf(cutils.CatalogExternalIDFormat, cutils.SystemLibraryName, monitoringTemplateName, version), nil
 }
 
 type templateRegexpResult struct {
@@ -243,17 +288,16 @@ func (tr *templateRegexp) translate(value string) *templateRegexpResult {
 	return captures
 }
 
-func GetOverwroteAppAnswers(annotations map[string]string) map[string]string {
+func GetOverwroteAppAnswersAndVersion(annotations map[string]string) (map[string]string, string) {
 	overwritingAppAnswers := annotations[cattleOverwriteAppAnswersAnnotationKey]
 	if len(overwritingAppAnswers) != 0 {
-		var appOverwriteInput mgmtv3.MonitoringInput
+		var appOverwriteInput v32.MonitoringInput
 		err := json.Unmarshal([]byte(overwritingAppAnswers), &appOverwriteInput)
 		if err == nil {
-			return appOverwriteInput.Answers
+			return appOverwriteInput.Answers, appOverwriteInput.Version
 		}
-
 		logrus.Errorf("failed to parse app overwrite input from %q, %v", overwritingAppAnswers, err)
 	}
 
-	return map[string]string{}
+	return map[string]string{}, ""
 }

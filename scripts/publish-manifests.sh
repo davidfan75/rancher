@@ -98,11 +98,15 @@ docker pull gcr.io/google_containers/pause-amd64:3.1
 docker tag gcr.io/google_containers/pause-amd64:3.1 rancher/pause:3.1-amd64
 docker pull gcr.io/google_containers/pause-arm64:3.1
 docker tag gcr.io/google_containers/pause-arm64:3.1 rancher/pause:3.1-arm64
+docker pull gcr.io/google_containers/pause-arm:3.1
+docker tag gcr.io/google_containers/pause-arm:3.1 rancher/pause:3.1-arm
 docker push rancher/pause:3.1-amd64
 docker push rancher/pause:3.1-arm64
-docker manifest create rancher/pause:3.1 rancher/pause:3.1-amd64 rancher/pause:3.1-arm64
+docker push rancher/pause:3.1-arm
+docker manifest create rancher/pause:3.1 rancher/pause:3.1-amd64 rancher/pause:3.1-arm64 rancher/pause:3.1-arm
 docker manifest annotate rancher/pause:3.1 rancher/pause:3.1-amd64 --arch amd64
 docker manifest annotate rancher/pause:3.1 rancher/pause:3.1-arm64 --arch arm64
+docker manifest annotate rancher/pause:3.1 rancher/pause:3.1-arm --arch arm
 docker manifest push -p rancher/pause:3.1
 
 #gcr.io/google_containers/metrics-server:v0.3.1
@@ -117,38 +121,38 @@ docker manifest annotate rancher/metrics-server:v0.3.1 rancher/metrics-server:v0
 docker manifest annotate rancher/metrics-server:v0.3.1 rancher/metrics-server:v0.3.1-arm64 --arch arm64
 docker manifest push -p rancher/metrics-server:v0.3.1
 
-#gcr.io/google_containers/k8s-dns-kube-dns:1.15.0
-docker pull gcr.io/google_containers/k8s-dns-kube-dns-amd64:1.15.0
-docker tag gcr.io/google_containers/k8s-dns-kube-dns-amd64:1.15.0 rancher/k8s-dns-kube-dns:1.15.0-amd64
-docker pull gcr.io/google_containers/k8s-dns-kube-dns-arm64:1.15.0
-docker tag gcr.io/google_containers/k8s-dns-kube-dns-arm64:1.15.0 rancher/k8s-dns-kube-dns:1.15.0-arm64
-docker push rancher/k8s-dns-kube-dns:1.15.0-amd64
-docker push rancher/k8s-dns-kube-dns:1.15.0-arm64
-docker manifest create rancher/k8s-dns-kube-dns:1.15.0 rancher/k8s-dns-kube-dns:1.15.0-amd64 rancher/k8s-dns-kube-dns:1.15.0-arm64
-docker manifest annotate rancher/k8s-dns-kube-dns:1.15.0 rancher/k8s-dns-kube-dns:1.15.0-amd64 --arch amd64
-docker manifest annotate rancher/k8s-dns-kube-dns:1.15.0 rancher/k8s-dns-kube-dns:1.15.0-arm64 --arch arm64
-docker manifest push -p rancher/k8s-dns-kube-dns:1.15.0
+#gcr.io/google_containers/k8s-dns-kube-dns:1.15.2
+docker pull gcr.io/google_containers/k8s-dns-kube-dns-amd64:1.15.2
+docker tag gcr.io/google_containers/k8s-dns-kube-dns-amd64:1.15.2 rancher/k8s-dns-kube-dns:1.15.2-amd64
+docker pull gcr.io/google_containers/k8s-dns-kube-dns-arm64:1.15.2
+docker tag gcr.io/google_containers/k8s-dns-kube-dns-arm64:1.15.2 rancher/k8s-dns-kube-dns:1.15.2-arm64
+docker push rancher/k8s-dns-kube-dns:1.15.2-amd64
+docker push rancher/k8s-dns-kube-dns:1.15.2-arm64
+docker manifest create rancher/k8s-dns-kube-dns:1.15.2 rancher/k8s-dns-kube-dns:1.15.2-amd64 rancher/k8s-dns-kube-dns:1.15.2-arm64
+docker manifest annotate rancher/k8s-dns-kube-dns:1.15.2 rancher/k8s-dns-kube-dns:1.15.2-amd64 --arch amd64
+docker manifest annotate rancher/k8s-dns-kube-dns:1.15.2 rancher/k8s-dns-kube-dns:1.15.2-arm64 --arch arm64
+docker manifest push -p rancher/k8s-dns-kube-dns:1.15.2
 
-#gcr.io/google_containers/k8s-dns-dnsmasq-nanny:1.15.0
-docker pull gcr.io/google_containers/k8s-dns-dnsmasq-nanny-amd64:1.15.0
-docker tag gcr.io/google_containers/k8s-dns-dnsmasq-nanny-amd64:1.15.0 rancher/k8s-dns-dnsmasq-nanny:1.15.0-amd64
-docker pull gcr.io/google_containers/k8s-dns-dnsmasq-nanny-arm64:1.15.0
-docker tag gcr.io/google_containers/k8s-dns-dnsmasq-nanny-arm64:1.15.0 rancher/k8s-dns-dnsmasq-nanny:1.15.0-arm64
-docker push rancher/k8s-dns-dnsmasq-nanny:1.15.0-amd64
-docker push rancher/k8s-dns-dnsmasq-nanny:1.15.0-arm64
-docker manifest create rancher/k8s-dns-dnsmasq-nanny:1.15.0 rancher/k8s-dns-dnsmasq-nanny:1.15.0-amd64 rancher/k8s-dns-dnsmasq-nanny:1.15.0-arm64
-docker manifest annotate rancher/k8s-dns-dnsmasq-nanny:1.15.0 rancher/k8s-dns-dnsmasq-nanny:1.15.0-amd64 --arch amd64
-docker manifest annotate rancher/k8s-dns-dnsmasq-nanny:1.15.0 rancher/k8s-dns-dnsmasq-nanny:1.15.0-arm64 --arch arm64
-docker manifest push -p rancher/k8s-dns-dnsmasq-nanny:1.15.0
+#gcr.io/google_containers/k8s-dns-dnsmasq-nanny:1.15.2
+docker pull gcr.io/google_containers/k8s-dns-dnsmasq-nanny-amd64:1.15.2
+docker tag gcr.io/google_containers/k8s-dns-dnsmasq-nanny-amd64:1.15.2 rancher/k8s-dns-dnsmasq-nanny:1.15.2-amd64
+docker pull gcr.io/google_containers/k8s-dns-dnsmasq-nanny-arm64:1.15.2
+docker tag gcr.io/google_containers/k8s-dns-dnsmasq-nanny-arm64:1.15.2 rancher/k8s-dns-dnsmasq-nanny:1.15.2-arm64
+docker push rancher/k8s-dns-dnsmasq-nanny:1.15.2-amd64
+docker push rancher/k8s-dns-dnsmasq-nanny:1.15.2-arm64
+docker manifest create rancher/k8s-dns-dnsmasq-nanny:1.15.2 rancher/k8s-dns-dnsmasq-nanny:1.15.2-amd64 rancher/k8s-dns-dnsmasq-nanny:1.15.2-arm64
+docker manifest annotate rancher/k8s-dns-dnsmasq-nanny:1.15.2 rancher/k8s-dns-dnsmasq-nanny:1.15.2-amd64 --arch amd64
+docker manifest annotate rancher/k8s-dns-dnsmasq-nanny:1.15.2 rancher/k8s-dns-dnsmasq-nanny:1.15.2-arm64 --arch arm64
+docker manifest push -p rancher/k8s-dns-dnsmasq-nanny:1.15.2
 
-#gcr.io/google_containers/k8s-dns-sidecar:1.15.0
-docker pull gcr.io/google_containers/k8s-dns-sidecar-amd64:1.15.0
-docker tag gcr.io/google_containers/k8s-dns-sidecar-amd64:1.15.0 rancher/k8s-dns-sidecar:1.15.0-amd64
-docker pull gcr.io/google_containers/k8s-dns-sidecar-arm64:1.15.0
-docker tag gcr.io/google_containers/k8s-dns-sidecar-arm64:1.15.0 rancher/k8s-dns-sidecar:1.15.0-arm64
-docker push rancher/k8s-dns-sidecar:1.15.0-amd64
-docker push rancher/k8s-dns-sidecar:1.15.0-arm64
-docker manifest create rancher/k8s-dns-sidecar:1.15.0 rancher/k8s-dns-sidecar:1.15.0-amd64 rancher/k8s-dns-sidecar:1.15.0-arm64
-docker manifest annotate rancher/k8s-dns-sidecar:1.15.0 rancher/k8s-dns-sidecar:1.15.0-amd64 --arch amd64
-docker manifest annotate rancher/k8s-dns-sidecar:1.15.0 rancher/k8s-dns-sidecar:1.15.0-arm64 --arch arm64
-docker manifest push -p rancher/k8s-dns-sidecar:1.15.0
+#gcr.io/google_containers/k8s-dns-sidecar:1.15.2
+docker pull gcr.io/google_containers/k8s-dns-sidecar-amd64:1.15.2
+docker tag gcr.io/google_containers/k8s-dns-sidecar-amd64:1.15.2 rancher/k8s-dns-sidecar:1.15.2-amd64
+docker pull gcr.io/google_containers/k8s-dns-sidecar-arm64:1.15.2
+docker tag gcr.io/google_containers/k8s-dns-sidecar-arm64:1.15.2 rancher/k8s-dns-sidecar:1.15.2-arm64
+docker push rancher/k8s-dns-sidecar:1.15.2-amd64
+docker push rancher/k8s-dns-sidecar:1.15.2-arm64
+docker manifest create rancher/k8s-dns-sidecar:1.15.2 rancher/k8s-dns-sidecar:1.15.2-amd64 rancher/k8s-dns-sidecar:1.15.2-arm64
+docker manifest annotate rancher/k8s-dns-sidecar:1.15.2 rancher/k8s-dns-sidecar:1.15.2-amd64 --arch amd64
+docker manifest annotate rancher/k8s-dns-sidecar:1.15.2 rancher/k8s-dns-sidecar:1.15.2-arm64 --arch arm64
+docker manifest push -p rancher/k8s-dns-sidecar:1.15.2
